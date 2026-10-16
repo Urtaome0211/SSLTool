@@ -6,3 +6,5 @@ dist/
 .venv/
 
 _bat_test.log
+
+release/
