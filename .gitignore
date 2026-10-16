@@ -4,3 +4,5 @@ build/
 dist/
 *.spec
 .venv/
+
+_bat_test.log
