@@ -11,6 +11,8 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame,
                              QAbstractItemView)
 
 from app.core.sftp_worker import SFTPWorker
+from app.ui.hostkey_dialog import (confirm_changed_host_key,
+                                   confirm_unknown_host_key)
 
 
 def _fmt_size(n):
@@ -234,6 +236,8 @@ class SFTPTab(QWidget):
         w.opDone.connect(self._on_op_done)
         w.opFailed.connect(self._on_op_failed)
         w.transferProgress.connect(self._on_progress)
+        w.hostKeyUnknown.connect(self._on_host_key_unknown)
+        w.hostKeyChanged.connect(self._on_host_key_changed)
         self.worker = w
 
     def start(self):
@@ -264,6 +268,27 @@ class SFTPTab(QWidget):
         self._end_progress()
         QMessageBox.critical(self, "SFTP 连接失败", msg)
         self.tabClosed.emit(self)
+
+    # ---------------- 主机密钥 TOFU ----------------
+
+    def _on_host_key_unknown(self, fp):
+        self._set_status("确认主机密钥…", "#e6a23c")
+        p = self._params
+        ok = confirm_unknown_host_key(self, p["host"], int(p["port"]), fp)
+        if self.worker:
+            self.worker.resolve_host_key(ok)
+        if not ok:
+            self._set_status("已取消：未确认主机密钥", "#f56c6c")
+
+    def _on_host_key_changed(self, fp, expected):
+        self._set_status("主机密钥已变更！", "#f56c6c")
+        p = self._params
+        ok = confirm_changed_host_key(self, p["host"], int(p["port"]),
+                                      fp, expected)
+        if self.worker:
+            self.worker.resolve_host_key(ok)
+        if not ok:
+            self._set_status("已取消：主机密钥与记录不一致", "#f56c6c")
 
     def _on_disconnected(self, reason):
         self._connected = False

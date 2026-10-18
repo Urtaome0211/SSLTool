@@ -8,6 +8,8 @@ from datetime import datetime
 import paramiko
 from PyQt5.QtCore import QThread, pyqtSignal
 
+from app.core.hostkey import HostKeyGate, HostKeyProbeError, fingerprint_sha256
+
 
 class _TransferCancelled(Exception):
     """传输被用户取消（内部控制流）。"""
@@ -21,6 +23,8 @@ class SFTPWorker(QThread):
     opDone = pyqtSignal(str)                 # 操作完成描述
     opFailed = pyqtSignal(str)               # 操作失败原因
     transferProgress = pyqtSignal(int, int)  # done, total
+    hostKeyUnknown = pyqtSignal(str)         # 服务器指纹（首次连接）
+    hostKeyChanged = pyqtSignal(str, str)    # 新指纹, 已记录指纹（疑似中间人）
 
     def __init__(self, host, port, username, password=None, key_path=None,
                  passphrase=None, parent=None):
@@ -37,6 +41,22 @@ class SFTPWorker(QThread):
         self._sftp = None
         self._connected = False
         self._cancel = False
+        self._gate = None
+
+    def stop(self) -> None:
+        """停止线程；若正阻塞等待主机密钥确认，同时唤醒。"""
+        self._running = False
+        self._queue.put(("stop", None))
+        if self._gate is not None:
+            self._gate.cancel()
+
+    def resolve_host_key(self, accept: bool) -> None:
+        """GUI 对主机密钥确认对话框做出决定后调用（可从任意线程调用）。"""
+        if self._gate is not None:
+            if accept:
+                self._gate.accept()
+            else:
+                self._gate.reject()
 
     # ---------------- UI 线程命令接口 ----------------
     def listdir(self, path: str) -> None:
@@ -56,10 +76,6 @@ class SFTPWorker(QThread):
 
     def rename(self, old: str, new: str) -> None:
         self._queue.put(("rename", (old, new)))
-
-    def stop(self) -> None:
-        self._running = False
-        self._queue.put(("stop", None))
 
     def begin_transfer(self) -> None:
         """新一轮传输开始前调用：清除旧的取消标记。"""
@@ -90,6 +106,21 @@ class SFTPWorker(QThread):
     # ---------------- 线程主循环 ----------------
     def run(self):
         try:
+            self._gate = HostKeyGate(self.host, self.port,
+                                     on_unknown=self.hostKeyUnknown.emit,
+                                     on_changed=self.hostKeyChanged.emit)
+            verdict, _key, fp, expected = self._gate.wait()
+            if verdict == "timeout":
+                self.error.emit("主机密钥确认超时，连接已取消")
+                return
+            if verdict == "cancelled":
+                return
+            if verdict == "rejected":
+                if expected:
+                    self.error.emit("已取消：主机密钥与既有记录不一致，未获确认")
+                else:
+                    self.error.emit("已取消：未确认服务器主机密钥")
+                return
             client = paramiko.SSHClient()
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             kwargs = dict(
@@ -104,6 +135,13 @@ class SFTPWorker(QThread):
             else:
                 kwargs["password"] = self.password or ""
             client.connect(**kwargs)
+            # 复核：认证连接的实际主机密钥必须与用户确认的值一致。
+            actual = fingerprint_sha256(
+                client.get_transport().get_remote_server_key())
+            if actual != fp:
+                client.close()
+                raise RuntimeError(
+                    "主机密钥在连接过程中被替换（疑似中间人攻击），已中止")
             sftp = client.open_sftp()
             self._client = client
             self._sftp = sftp
@@ -125,6 +163,8 @@ class SFTPWorker(QThread):
                     self.opDone.emit("已取消")
                 except Exception as e:
                     self.opFailed.emit(str(e))
+        except HostKeyProbeError as e:
+            self.error.emit(str(e))
         except Exception as e:
             self.error.emit(f"连接失败: {e}")
         finally:

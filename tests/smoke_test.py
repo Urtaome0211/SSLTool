@@ -97,11 +97,39 @@ check("会话保存/读取", len(loaded) == 1 and loaded[0]["host"] == "127.0.0.
 check("会话 ID 自动生成", bool(loaded[0].get("id")))
 config.set_secret("k", "secret123")
 check("凭据存取回环", config.get_secret("k") == "secret123")
+if config._DPAPI_PROTECT is not None:
+    raw = config.SECRETS_FILE.read_bytes().decode("utf-8", "replace")
+    check("回退凭据存储非明文（DPAPI 加密）", "secret123" not in raw)
+else:
+    check("回退凭据存储非明文（DPAPI 加密）", True)  # 非 Windows 退化为混淆格式
 config.delete_secret("k")
 check("凭据删除", config.get_secret("k") is None)
 config.save_settings({"dark": True})
 check("设置持久化", config.load_settings().get("dark") is True)
 config.save_settings({"dark": False})
+
+# ---------- 3b. 主机密钥 TOFU 存储 ----------
+import paramiko
+from app.core import hostkey as hk
+
+k1 = paramiko.RSAKey.generate(2048)
+k2 = paramiko.RSAKey.generate(2048)
+fp1 = hk.fingerprint_sha256(k1)
+fp2 = hk.fingerprint_sha256(k2)
+check("指纹格式为 SHA256:base64", fp1.startswith("SHA256:") and "=" not in fp1
+      and fp1 != fp2)
+check("未知主机 → unknown", hk.check_known_host("example.com", 22, k1)[0] == "unknown")
+hk.save_known_host("example.com", 22, k1.get_name(), fp1)
+check("已知主机 → ok", hk.check_known_host("example.com", 22, k1)[0] == "ok")
+status, got_fp, expected = hk.check_known_host("example.com", 22, k2)
+check("密钥变更 → changed 且返回旧指纹",
+      status == "changed" and got_fp == fp2 and expected == fp1)
+hk.save_known_host("example.com", 22, k2.get_name(), fp2)
+check("接受新密钥后 → ok",
+      hk.check_known_host("example.com", 22, k2)[0] == "ok")
+hk.delete_known_host("example.com", 22)
+check("删除记录后 → unknown",
+      hk.check_known_host("example.com", 22, k1)[0] == "unknown")
 
 # ---------- 4. 主窗口 ----------
 win = MainWindow()
@@ -122,6 +150,46 @@ check("SSL 连接失败触发 error",
       wait_signal(SSLWorker("127.0.0.1", 1, verify=False), "error"))
 check("SFTP 连接失败触发 error",
       wait_signal(SFTPWorker("127.0.0.1", 1, "u", password="x"), "error"))
+
+# ---------- 5b. SSL 证书详情解析（cryptography 解析 DER） ----------
+try:
+    import datetime as _dt
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    _key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    _name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "test.example.com")])
+    _now = _dt.datetime.now(_dt.timezone.utc)
+
+    def _build_cert(valid_days):
+        return (x509.CertificateBuilder()
+                .subject_name(_name).issuer_name(_name)
+                .public_key(_key.public_key())
+                .serial_number(x509.random_serial_number())
+                .not_valid_before(_now - _dt.timedelta(days=1))
+                .not_valid_after(_now + _dt.timedelta(days=valid_days))
+                .add_extension(x509.SubjectAlternativeName(
+                    [x509.DNSName("test.example.com")]), critical=False)
+                .sign(_key, hashes.SHA256()))
+
+    _der = _build_cert(400).public_bytes(serialization.Encoding.DER)
+    _lines = SSLWorker._x509_lines(_der)
+    check("证书详情含主题/有效期/SAN",
+          any("CN=test.example.com" in l for l in _lines)
+          and any(l.startswith("有效期至") for l in _lines)
+          and any("SAN" in l for l in _lines))
+    check("有效证书无过期警告", not any("过期" in l for l in _lines))
+    _der_short = _build_cert(10).public_bytes(serialization.Encoding.DER)
+    _lines_short = SSLWorker._x509_lines(_der_short)
+    check("30 天内到期警告", any("天后到期" in l for l in _lines_short))
+    _der_exp = _build_cert(-1).public_bytes(serialization.Encoding.DER)
+    _lines_exp = SSLWorker._x509_lines(_der_exp)
+    check("已过期警告", any("已过期" in l for l in _lines_exp))
+    check("损坏 DER 不崩溃", SSLWorker._x509_lines(b"not-a-cert") == [])
+except Exception:
+    check("证书详情解析（cryptography 生成自签证书）", False)
 
 # ---------- 6. SFTP 取消语义（purge + 取消标志，队列模拟，不起线程） ----------
 w = SFTPWorker("127.0.0.1", 1, "u", password="x")

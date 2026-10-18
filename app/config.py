@@ -2,10 +2,13 @@
 
 会话配置保存于 ~/.ssltool/sessions.json。
 密码 / 私钥口令优先保存到系统钥匙串（keyring），
-无可用 keyring 后端时回退到 ~/.ssltool/secrets.json（仅 base64 混淆，不推荐）。
+无可用 keyring 后端时回退到 ~/.ssltool/secrets.json。
+回退存储默认用 Windows DPAPI（CryptProtectData，绑定当前用户账户）整体加密；
+DPAPI 不可用（非 Windows 等）时退化为 base64 混淆格式（不推荐）。
 """
 import base64
 import json
+import sys
 import uuid
 from pathlib import Path
 
@@ -20,6 +23,70 @@ SESSIONS_FILE = DATA_DIR / "sessions.json"
 SECRETS_FILE = DATA_DIR / "secrets.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 SERVICE = "SSLTool"
+
+
+# ---------------- Windows DPAPI（回退存储的静态加密） ----------------
+
+def _setup_dpapi():
+    """返回 (protect, unprotect) 两个可调用，或 (None, None) 表示不可用。"""
+    if sys.platform != "win32":
+        return None, None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _DATA_BLOB(ctypes.Structure):
+            _fields_ = [("cbData", wintypes.DWORD),
+                        ("pbData", ctypes.c_void_p)]
+
+        crypt32 = ctypes.windll.crypt32
+        kernel32 = ctypes.windll.kernel32
+
+        def _blob_to_bytes(blob):
+            try:
+                if not blob.pbData:
+                    return b""
+                return ctypes.string_at(blob.pbData, blob.cbData)
+            finally:
+                if blob.pbData:
+                    kernel32.LocalFree(blob.pbData)
+
+        def protect(data: bytes) -> bytes:
+            if not data:
+                return b""
+            src = ctypes.create_string_buffer(data)
+            indata = _DATA_BLOB(len(data), ctypes.cast(src, ctypes.c_void_p))
+            outdata = _DATA_BLOB()
+            ok = crypt32.CryptProtectData(
+                ctypes.byref(indata), None, None, None, None, 0,
+                ctypes.byref(outdata))
+            if not ok:
+                raise OSError(ctypes.GetLastError())
+            return _blob_to_bytes(outdata)
+
+        def unprotect(blob: bytes) -> bytes:
+            if not blob:
+                return b""
+            src = ctypes.create_string_buffer(blob)
+            indata = _DATA_BLOB(len(blob), ctypes.cast(src, ctypes.c_void_p))
+            outdata = _DATA_BLOB()
+            ok = crypt32.CryptUnprotectData(
+                ctypes.byref(indata), None, None, None, None, 0,
+                ctypes.byref(outdata))
+            if not ok:
+                raise OSError(ctypes.GetLastError())
+            return _blob_to_bytes(outdata)
+
+        # 冒烟自检：确保参数签名在当前系统上真正可用
+        probe = protect(b"SSLTool dpapi probe")
+        if unprotect(probe) != b"SSLTool dpapi probe":
+            raise RuntimeError("DPAPI round-trip mismatch")
+        return protect, unprotect
+    except Exception:
+        return None, None
+
+
+_DPAPI_PROTECT, _DPAPI_UNPROTECT = _setup_dpapi()
 
 
 def ensure_data_dir() -> None:
@@ -91,11 +158,35 @@ def make_session(**kwargs) -> dict:
 # ---------------- 凭据存取 ----------------
 
 def _fallback_store() -> dict:
-    return _load_json(SECRETS_FILE, {})
+    """读取回退凭据存储；兼容 DPAPI 加密格式与旧 base64 混淆格式。"""
+    raw = _load_json(SECRETS_FILE, {})
+    if not isinstance(raw, dict):
+        return {}
+    if raw.get("format") == "dpapi" and _DPAPI_UNPROTECT is not None:
+        try:
+            plain = _DPAPI_UNPROTECT(base64.b64decode(raw.get("blob", "")))
+            data = json.loads(plain.decode("utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+    if "format" not in raw and "blob" not in raw:
+        # 旧格式：{key: base64(value)}，读取后由下次写入时迁移加密
+        return raw
+    return {}
 
 
 def _save_fallback_store(data: dict) -> None:
     ensure_data_dir()
+    if _DPAPI_PROTECT is not None:
+        try:
+            payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
+            blob = base64.b64encode(_DPAPI_PROTECT(payload)).decode("ascii")
+            with open(SECRETS_FILE, "w", encoding="utf-8") as f:
+                json.dump({"format": "dpapi", "blob": blob}, f)
+            return
+        except Exception:
+            pass
+    # 退化路径（非 Windows 或 DPAPI 失败）：旧 base64 混淆格式
     with open(SECRETS_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 

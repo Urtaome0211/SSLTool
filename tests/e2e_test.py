@@ -8,6 +8,8 @@
 测试 4（本地回显兜底）：服务器完全不回显时，终端勾选「本地回显」后键入的文字可见。
 测试 5（滚动位置）：用户向上翻看历史时，新输出不把页面拉回底部。
 测试 6（回显去重）：服务器回显 + 本地回显同时开启时，键入字符只显示一次。
+测试 7（主机密钥 TOFU）：未知密钥需确认并保存；密钥变更警告旧指纹；拒绝变更时
+     服务器不应收到任何认证凭据；接受变更后记录更新并重新连接。
 """
 import os
 import re
@@ -28,8 +30,10 @@ from PyQt5.QtGui import QKeyEvent
 from PyQt5.QtWidgets import QApplication, QDialog
 
 from app import config
+from app.core import hostkey as hk
 from app.core.workers import SSHWorker
 from app.ui.connect_dialog import ConnectDialog
+from app.ui.hostkey_dialog import HostKeyDialog
 from app.ui.main_window import MainWindow
 from app.ui.terminal_tab import ConsoleTab
 from app.ui.terminal_widget import TerminalWidget
@@ -123,6 +127,7 @@ class EchoServer(paramiko.ServerInterface):
 
     spam = False       # 类属性开关：持续向会话灌数据（模拟繁忙服务器）
     never_echo = False  # 类属性开关：无论请求与否都不回显（模拟不回显的设备）
+    auth_attempts = 0   # 类属性：累计认证尝试次数（TOFU 拒绝路径验证用）
 
     def __init__(self):
         self.echo = False
@@ -132,6 +137,7 @@ class EchoServer(paramiko.ServerInterface):
         self._forward_listeners = []
 
     def check_auth_password(self, username, password):
+        EchoServer.auth_attempts += 1
         return paramiko.AUTH_SUCCESSFUL
 
     def get_allowed_auths(self, username):
@@ -264,12 +270,16 @@ class EchoServer(paramiko.ServerInterface):
                     pass
 
 
-def _start_server() -> int:
+def _start_server(seed_host_key: bool = True) -> int:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("127.0.0.1", 0))
     sock.listen(8)
     port = sock.getsockname()[1]
+    if seed_host_key:
+        # 预置已知主机记录，让 TOFU 门禁直接放行（TOFU 专项测试传 False）
+        hk.save_known_host("127.0.0.1", port, _HOST_KEY.get_name(),
+                           hk.fingerprint_sha256(_HOST_KEY))
 
     def accept_loop():
         while True:
@@ -670,11 +680,79 @@ def test_port_forwarding():
     print("[PASS] test_port_forwarding: -L/-R/-D 端口转发回显全部成功")
 
 
+def test_host_key_tofu():
+    """主机密钥 TOFU：未知需确认；变更需警告；拒绝变更后服务器不应收到凭据。"""
+    port = _start_server(seed_host_key=False)
+
+    # (1) 未知密钥 → hostKeyUnknown → 接受 → 连接成功并保存记录
+    w = SSHWorker("127.0.0.1", port, "tester", password="pw")
+    unknowns, errors = [], []
+    w.hostKeyUnknown.connect(lambda fp: (unknowns.append(fp),
+                                         w.resolve_host_key(True)))
+    w.error.connect(errors.append)
+    w.start()
+    ok = _wait_for(lambda: w._connected, timeout=20.0)
+    w.stop()
+    w.wait(3000)
+    if not ok:
+        raise AssertionError("接受主机密钥后应连接成功: errors=%r" % errors)
+    assert len(unknowns) == 1, "首次连接应恰好触发一次 hostKeyUnknown"
+    entry = hk.load_known_hosts().get(hk.hostkey_id("127.0.0.1", port))
+    assert entry and entry["fingerprint"] == unknowns[0], \
+        "接受后应将指纹写入 known_hosts"
+    assert unknowns[0] == hk.fingerprint_sha256(_HOST_KEY), "指纹内容不符"
+
+    # (2) 密钥变更 → hostKeyChanged → 拒绝 → error 且服务器未收到任何凭据
+    hk.save_known_host("127.0.0.1", port, "ssh-rsa",
+                       "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+    EchoServer.auth_attempts = 0
+    w2 = SSHWorker("127.0.0.1", port, "tester", password="pw")
+    changed, errors2 = [], []
+    w2.hostKeyChanged.connect(lambda fp, old: (changed.append((fp, old)),
+                                               w2.resolve_host_key(False)))
+    w2.error.connect(errors2.append)
+    w2.start()
+    ok = _wait_for(lambda: changed or errors2, timeout=20.0)
+    # error 通过队列信号投递，需继续跑事件循环直到槽函数执行
+    _wait_for(lambda: errors2, timeout=5.0)
+    w2.wait(3000)
+    assert changed, "密钥变更应触发 hostKeyChanged"
+    assert changed[0][1] == "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", \
+        "hostKeyChanged 应携带旧指纹"
+    assert errors2 and any("不一致" in m for m in errors2), \
+        "拒绝变更后应触发 error（密钥不一致）"
+    assert not w2._connected
+    assert EchoServer.auth_attempts == 0, \
+        "拒绝后不得向服务器发送任何凭据（实际认证次数 %d）" % EchoServer.auth_attempts
+
+    # (3) 密钥变更 → 接受 → 重新连接成功且记录更新
+    hk.save_known_host("127.0.0.1", port, "ssh-rsa",
+                       "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+    w3 = SSHWorker("127.0.0.1", port, "tester", password="pw")
+    w3.hostKeyChanged.connect(lambda fp, old: w3.resolve_host_key(True))
+    w3.start()
+    ok = _wait_for(lambda: w3._connected, timeout=20.0)
+    w3.stop()
+    w3.wait(3000)
+    if not ok:
+        raise AssertionError("接受变更密钥后应重新连接成功")
+    entry = hk.load_known_hosts().get(hk.hostkey_id("127.0.0.1", port))
+    assert entry["fingerprint"] == hk.fingerprint_sha256(_HOST_KEY), \
+        "接受新密钥后应更新记录"
+
+    # (4) 主机密钥确认对话框可独立构造
+    d1 = HostKeyDialog(None, "h", 22, "SHA256:x", None)
+    d2 = HostKeyDialog(None, "h", 22, "SHA256:x", "SHA256:y")
+    assert "首次" in d1.windowTitle() and "变更" in d2.windowTitle()
+
+    print("[PASS] test_host_key_tofu: 未知确认/变更警告/拒绝不泄凭据 全部正常")
+
+
 def main():
     app = QApplication.instance() or QApplication([])
     tests = [test_ssh_echo, test_new_session_while_connected,
              test_dialog_visibility, test_local_echo, test_echo_suppression,
-             test_scroll_follow, test_port_forwarding]
+             test_scroll_follow, test_port_forwarding, test_host_key_tofu]
     for fn in tests:
         # 每个测试前复位服务器开关，防止前一测试的类属性状态污染
         EchoServer.spam = False

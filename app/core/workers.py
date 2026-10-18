@@ -3,6 +3,7 @@ import hashlib
 import queue
 import socket
 import ssl
+from datetime import datetime, timezone
 
 import paramiko
 from paramiko.common import cMSG_CHANNEL_REQUEST
@@ -11,6 +12,13 @@ from PyQt5.QtCore import QThread, pyqtSignal
 
 from app.core.forwarders import (LocalForward, RemoteForward, Socks5Forward,
                                  parse_forwards)
+from app.core.hostkey import HostKeyGate, HostKeyProbeError, fingerprint_sha256
+
+try:
+    from cryptography import x509
+    _X509_OK = True
+except Exception:
+    _X509_OK = False
 
 # RFC 4254 §8 终端模式（pty-req 的 encoded terminal modes）。
 # paramiko 的 invoke_shell 发送空 modes，部分服务器（Windows sshd、网络设备等）
@@ -71,12 +79,22 @@ class BaseWorker(QThread):
 
 
 class SSHWorker(BaseWorker):
-    """SSH 交互式终端线程（pty shell）。"""
+    """SSH 交互式终端线程（pty shell）。
+
+    安全流程（TOFU）：
+      1. 先做只含密钥交换的探测连接，取得服务器主机密钥 —— 此时尚未发送密码/私钥签名；
+      2. 与 ~/.ssltool/known_hosts.json 比对，未知或变更时发射 hostKeyUnknown /
+         hostKeyChanged 信号，阻塞等待 GUI 确认（resolve_host_key）；
+      3. 确认后才建立认证连接，并在连接建立后复核实际密钥指纹，防止
+         探测与认证两条 TCP 连接被中间人分别劫持。
+    """
 
     connected = pyqtSignal()
     dataReceived = pyqtSignal(bytes)
     forwardStarted = pyqtSignal(str)
     forwardError = pyqtSignal(str)
+    hostKeyUnknown = pyqtSignal(str)        # 服务器指纹（首次连接）
+    hostKeyChanged = pyqtSignal(str, str)   # 新指纹, 已记录指纹（疑似中间人）
 
     def __init__(self, host, port, username, password=None, key_path=None,
                  passphrase=None, forwards=None, parent=None):
@@ -92,6 +110,21 @@ class SSHWorker(BaseWorker):
         self._chan = None
         self._connected = False
         self._forwarders = []
+        self._gate = None
+
+    def stop(self) -> None:
+        """停止线程；若正阻塞等待主机密钥确认，同时唤醒。"""
+        super().stop()
+        if self._gate is not None:
+            self._gate.cancel()
+
+    def resolve_host_key(self, accept: bool) -> None:
+        """GUI 对主机密钥确认对话框做出决定后调用（可从任意线程调用）。"""
+        if self._gate is not None:
+            if accept:
+                self._gate.accept()
+            else:
+                self._gate.reject()
 
     def resize_pty(self, cols: int, rows: int) -> None:
         self._queue.put(("resize", (cols, rows)))
@@ -166,6 +199,21 @@ class SSHWorker(BaseWorker):
     def run(self):
         reason = ""
         try:
+            self._gate = HostKeyGate(self.host, self.port,
+                                     on_unknown=self.hostKeyUnknown.emit,
+                                     on_changed=self.hostKeyChanged.emit)
+            verdict, _key, fp, expected = self._gate.wait()
+            if verdict == "timeout":
+                self.error.emit("主机密钥确认超时，连接已取消")
+                return
+            if verdict == "cancelled":
+                return
+            if verdict == "rejected":
+                if expected:
+                    self.error.emit("已取消：主机密钥与既有记录不一致，未获确认")
+                else:
+                    self.error.emit("已取消：未确认服务器主机密钥")
+                return
             client = paramiko.SSHClient()
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             kwargs = dict(
@@ -180,6 +228,14 @@ class SSHWorker(BaseWorker):
             else:
                 kwargs["password"] = self.password or ""
             client.connect(**kwargs)
+            # 复核：认证连接的实际主机密钥必须与用户确认的值一致。
+            # 探测与认证是两条独立 TCP 连接，这一步防中间人分别劫持。
+            actual = fingerprint_sha256(
+                client.get_transport().get_remote_server_key())
+            if actual != fp:
+                client.close()
+                raise RuntimeError(
+                    "主机密钥在连接过程中被替换（疑似中间人攻击），已中止")
             self._start_forwarders(client)
             try:
                 chan = self._open_shell(client)
@@ -207,6 +263,8 @@ class SSHWorker(BaseWorker):
                 except Exception as e:
                     reason = str(e)
                     break
+        except HostKeyProbeError as e:
+            self.error.emit(str(e))
         except Exception as e:
             if not self._connected:
                 self.error.emit(f"连接失败: {e}")
@@ -302,6 +360,8 @@ class SSLWorker(BaseWorker):
 
     @staticmethod
     def _cert_info(tls) -> str:
+        """拼装证书详情：TLS 版本/套件、SHA-256 指纹、主题、颁发者、序列号、
+        SAN、有效期；即将到期（<30 天）或已过期时给出醒目警告。"""
         try:
             der = tls.getpeercert(binary_form=True)
             cipher = tls.cipher()
@@ -311,12 +371,42 @@ class SSLWorker(BaseWorker):
                 fp = hashlib.sha256(der).hexdigest().upper()
                 pretty = ":".join(fp[i:i + 2] for i in range(0, len(fp), 2))
                 lines.append(f"服务器证书 SHA-256 指纹: {pretty}")
+                lines.extend(SSLWorker._x509_lines(der))
             else:
                 lines.append("（未获取到服务器证书）")
-            cert = tls.getpeercert()
-            if isinstance(cert, dict) and cert.get("subject"):
-                subj = ", ".join(f"{k}={v}" for k, v in cert["subject"])
-                lines.append(f"证书主题: {subj}")
             return "\n".join(lines)
         except Exception as e:
             return f"获取证书信息失败: {e}"
+
+    @staticmethod
+    def _x509_lines(der: bytes) -> list:
+        """用 cryptography 解析 DER 证书，输出主题/颁发者/有效期/SAN 等行。
+        解析失败时回退为空白列表（指纹行仍会显示）。"""
+        if not _X509_OK:
+            return []
+        try:
+            cert = x509.load_der_x509_certificate(der)
+        except Exception:
+            return []
+        lines = []
+        try:
+            lines.append(f"证书主题: {cert.subject.rfc4514_string()}")
+            lines.append(f"颁发者: {cert.issuer.rfc4514_string()}")
+            lines.append(f"序列号: {cert.serial_number:x}")
+            san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+            names = san.value.get_values_for_type(x509.DNSName)
+            if names:
+                lines.append("备用名称 (SAN): " + ", ".join(names))
+            try:
+                not_after = cert.not_valid_after_utc
+            except Exception:
+                not_after = cert.not_valid_after.replace(tzinfo=timezone.utc)
+            days = (not_after - datetime.now(timezone.utc)).total_seconds() / 86400
+            lines.append("有效期至: %s（UTC）" % not_after.strftime("%Y-%m-%d %H:%M:%S"))
+            if days < 0:
+                lines.append("⚠ 证书已过期！")
+            elif days < 30:
+                lines.append("⚠ 证书将在 %d 天后到期" % int(days))
+        except Exception:
+            pass
+        return lines

@@ -8,8 +8,14 @@
 - **SSL 加密通道**：原始 TLS 文本控制台（类似 telnet-over-TLS），连接后显示服务器证书 SHA-256 指纹、TLS 版本与加密套件；可选证书验证与客户端证书
 - **SFTP 文件管理**：目录浏览、上传 / 下载（支持文件夹递归与总进度）、**拖拽上传 / 下载**、**传输可取消**、新建文件夹、重命名、删除
 - **SSH 端口转发**：本地转发（-L）、远程转发（-R）、动态 SOCKS5 代理（-D），会话配置里一行一条规则；连接后启动结果直接显示在终端里
-- **会话管理**：连接配置保存于 `~/.ssltool/sessions.json`；密码与私钥口令存入系统钥匙串（keyring），无可用后端时回退到 `~/.ssltool/secrets.json`（仅 base64 混淆，不推荐）
+- **会话管理**：连接配置保存于 `~/.ssltool/sessions.json`；密码与私钥口令存入系统钥匙串（keyring），无可用后端时回退到 `~/.ssltool/secrets.json`——Windows 下用 DPAPI（Windows 数据保护 API）加密，仅当前 Windows 用户可解密；其他平台回退为混淆格式（不推荐，建议安装 keyring 后端）
 - **深色主题**：菜单「视图 → 深色主题」（Ctrl+D）一键切换，偏好自动保存
+
+## 安全
+
+- **SSH 主机密钥验证（TOFU）**：连接时先做一次只含密钥交换的探测连接取回服务器主机密钥，与 `~/.ssltool/known_hosts.json` 比对——**在发送密码 / 私钥签名之前**完成校验。首次连接弹出指纹确认框（可与管理员公布的指纹比对）；已记录密钥发生变化时弹出醒目警告（疑似中间人攻击）；认证连接建立后还会复核实际密钥指纹，防止两条 TCP 连接被分别劫持
+- **凭据加密**：回退存储的密码在 Windows 上用 DPAPI 加密（见上）
+- **SSL 证书详情**：连接后显示服务器证书 SHA-256 指纹、主题 / 颁发者 / 序列号 / SAN、有效期，并给出到期（<30 天）与已过期警告
 
 ## 安装与运行
 
@@ -53,7 +59,7 @@
 ## 说明与限制
 
 - 终端基于 pyte 的 VT100/VT220 模拟：支持 xterm 16/256 色、粗体 / 下划线 / 反显、滚动缓冲；不支持备用屏幕（alt-screen，`vim` 等全屏程序在主屏幕缓冲中运行，可正常使用，仅外观略有折损）
-- SSH 主机密钥采用自动信任策略（AutoAddPolicy）
+- SSH 主机密钥采用「首次使用信任（TOFU）」策略：首次连接需人工确认指纹，密钥变化时警告（详见「安全」一节）；确认记录保存于 `~/.ssltool/known_hosts.json`
 - 端口转发规则不支持 IPv6 字面量地址；SOCKS5 仅支持 CONNECT 命令与无认证模式
 
 ## 目录结构
@@ -67,17 +73,19 @@ SSLTool/
 │   ├── config.py              # 会话与凭据存取
 │   ├── theme.py               # 扁平化 QSS 主题与应用图标
 │   ├── core/
-│   │   ├── workers.py         # SSH / SSL 连接线程
+│   │   ├── workers.py         # SSH / SSL 连接线程（含证书详情）
 │   │   ├── forwarders.py      # SSH 端口转发（-L / -R / -D SOCKS5）
+│   │   ├── hostkey.py         # 主机密钥 TOFU 探测 / 校验 / known_hosts 存储
 │   │   └── sftp_worker.py     # SFTP 连接线程
 │   └── ui/
 │       ├── terminal_widget.py # pyte 完整 VT 终端组件
 │       ├── terminal_tab.py    # 终端 / SSL 控制台标签页
 │       ├── sftp_tab.py        # SFTP 文件管理标签页（拖拽 / 可取消）
+│       ├── hostkey_dialog.py  # 主机密钥确认 / 变更警告对话框
 │       ├── connect_dialog.py  # 新建 / 编辑连接对话框
 │       └── main_window.py     # 主窗口
 └── tests/
-    ├── smoke_test.py          # 离屏冒烟测试（32 项）
+    ├── smoke_test.py          # 离屏冒烟测试（44 项）
     ├── gui_boot.py            # 主窗口启动自检
-    └── e2e_test.py            # 内置 SSH 服务器端到端测试（回显 / 去重 / 滚动 / 对话框 / 端口转发）
+    └── e2e_test.py            # 内置 SSH 服务器端到端测试（回显 / 去重 / 滚动 / 对话框 / 端口转发 / TOFU）
 ```

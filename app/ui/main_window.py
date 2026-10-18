@@ -16,13 +16,13 @@ from app.ui.connect_dialog import ConnectDialog
 from app.ui.terminal_tab import ConsoleTab
 from app.ui.sftp_tab import SFTPTab
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.2.0"
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SSLTool")
+        self.setWindowTitle(f"SSLTool v{APP_VERSION}")
         self.resize(1100, 700)
         self.sessions = config.load_sessions()
         self.settings = config.load_settings()

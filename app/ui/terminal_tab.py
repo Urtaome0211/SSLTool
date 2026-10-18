@@ -4,6 +4,8 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame,
                              QPushButton, QCheckBox)
 
 from app.core.workers import SSHWorker, SSLWorker
+from app.ui.hostkey_dialog import (confirm_changed_host_key,
+                                   confirm_unknown_host_key)
 from app.ui.terminal_widget import TerminalWidget
 
 
@@ -81,6 +83,8 @@ class ConsoleTab(QWidget):
         else:
             w.forwardStarted.connect(self._on_forward_started)
             w.forwardError.connect(self._on_forward_error)
+            w.hostKeyUnknown.connect(self._on_host_key_unknown)
+            w.hostKeyChanged.connect(self._on_host_key_changed)
         self.worker = w
 
     def start(self):
@@ -132,6 +136,27 @@ class ConsoleTab(QWidget):
 
     def _on_forward_error(self, msg):
         self.terminal.feed(("\r\n[端口转发失败: " + msg + "]\r\n").encode("utf-8"))
+
+    # ---------------- 主机密钥 TOFU ----------------
+
+    def _on_host_key_unknown(self, fp):
+        self._set_status("确认主机密钥…", "#e6a23c")
+        p = self._params
+        ok = confirm_unknown_host_key(self, p["host"], int(p["port"]), fp)
+        if self.worker:
+            self.worker.resolve_host_key(ok)
+        if not ok:
+            self._set_status("已取消：未确认主机密钥", "#f56c6c")
+
+    def _on_host_key_changed(self, fp, expected):
+        self._set_status("主机密钥已变更！", "#f56c6c")
+        p = self._params
+        ok = confirm_changed_host_key(self, p["host"], int(p["port"]),
+                                      fp, expected)
+        if self.worker:
+            self.worker.resolve_host_key(ok)
+        if not ok:
+            self._set_status("已取消：主机密钥与记录不一致", "#f56c6c")
 
     def _on_data_sent(self, data: bytes):
         if self.worker:
