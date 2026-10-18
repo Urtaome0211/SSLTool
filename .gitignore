@@ -8,3 +8,4 @@ dist/
 _bat_test.log
 
 release/
+*.zip
