@@ -3,14 +3,26 @@
 支持完整的 ANSI/VT 控制序列（光标定位、清屏、SGR 颜色、alternate 光标
 保存/恢复等），因此 vim / top / htop 等全屏程序可以正常使用。
 自带滚动回看缓冲（5000 行）与本地回显去重（见 _echo_expect）。
+
+V2.0 终端体验：
+- 备用屏幕（alt-screen）支持：CSI ?47h/l 与 CSI ?1049h/l（DECSET/DECRESET）
+  在独立的备用缓冲中运行全屏程序，退出后主屏幕（含滚动历史）原样恢复；
+- 括号粘贴（bracketed paste）：粘贴内容用 \\x1b[200~ … \\x1b[201~ 包裹，
+  避免多行粘贴被 shell 逐行当作命令执行；
+- 终端内搜索：Ctrl+F 打开搜索条，高亮命中并支持上下跳转；
+- 可点击 URL：Ctrl+点击 http(s):// 链接用系统浏览器打开，右键菜单可
+  复制 / 打开链接。
 """
+import re
 import unicodedata
 
 import pyte
-from PyQt5.QtCore import QRectF, Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import QRectF, Qt, QTimer, QUrl, pyqtSignal
 from PyQt5.QtGui import (QColor, QFont, QFontMetricsF, QKeySequence,
-                         QPainter)
-from PyQt5.QtWidgets import QApplication, QScrollBar, QWidget
+                         QPainter, QDesktopServices)
+from PyQt5.QtWidgets import (QAction, QApplication, QFrame, QHBoxLayout,
+                             QLabel, QLineEdit, QMenu, QPushButton,
+                             QScrollBar, QWidget)
 
 # xterm 标准 16 色
 _XTERM16 = [
@@ -31,6 +43,13 @@ _BG = QColor("#1e1e1e")   # 默认背景
 _FG = QColor("#d4d4d4")   # 默认前景
 
 _BLINK_MS = 600        # 光标闪烁周期
+
+_SEARCH_BG = QColor("#6b5b00")      # 搜索命中背景
+_SEARCH_CUR_BG = QColor("#f7d700")  # 当前命中背景（更强）
+
+# http(s) 链接（排除空白与常见引号/尖括号；尾部标点单独剔除）
+_URL_RE = re.compile(r"https?://[^\s'\"<>]+")
+_URL_TRAIL = ".,;:!?"
 
 
 def _xterm256(n: int) -> str:
@@ -56,8 +75,8 @@ def _echo_expect(data: bytes) -> bytes:
     本地回显开启时，键入字符已在本地显示，服务器若再回显同一内容会重复。
     这里按常见 pty 配置预测服务器将回显什么，供 feed_remote 前缀匹配去重：
     - 可见字符 → 原样（抑制）
-    - Backspace(\x7f) → "\\b \\b"（ECHOE 回显序列，抑制）
-    - Ctrl+C(\x03) → "^C"（ECHOCTL，抑制；其后的 \\r\\n 放行推进换行）
+    - Backspace(\\x7f) → "\\b \\b"（ECHOE 回显序列，抑制）
+    - Ctrl+C(\\x03) → "^C"（ECHOCTL，抑制；其后的 \\r\\n 放行推进换行）
     - 回车(\\r) → 不建模：服务器回显的 \\r\\n 必须放行，用于推进换行
       （本地只置 CR 挂起，不产生换行）
     - ESC 序列（方向键等）→ 不建模：readline 整行重绘无法预测
@@ -76,19 +95,132 @@ def _echo_expect(data: bytes) -> bytes:
     return bytes(out)
 
 
-class _SSLToolScreen(pyte.HistoryScreen):
-    """在 HistoryScreen 基础上：ED 2（清屏）同时清空滚动缓冲。
+# pyte.Screen / HistoryScreen 中"一个屏幕人格"的全部可变状态字段。
+# alt-screen 切换即是在同一个外观对象上换入/换出这些字段。
+_SCREEN_STATE_FIELDS = (
+    "columns", "lines", "buffer", "dirty", "mode", "margins", "title",
+    "icon_name", "charset", "g0_charset", "g1_charset", "tabstops",
+    "cursor", "savepoints", "saved_columns", "history",
+)
 
-    与旧实现（QPlainTextEdit.clear()）的行为保持一致，冒烟测试
-    「CSI 2J 清屏」断言 toPlainText() 为空依赖这一点。
+
+class _SSLToolScreen(pyte.HistoryScreen):
+    """HistoryScreen + ED2 清滚动缓冲 + 备用屏幕（alt-screen）支持。
+
+    备用屏幕实现：本对象是「外观（facade）」，pyte 的 Stream 自始至终只
+    持有这一个 listener（pyte 的解析器在初始化时缓存了 listener 的绑定
+    方法，中途换 listener 不会生效）。进入备用屏幕时，把当前（主屏）状态
+    快照收起来、把备用 pyte.Screen 的状态搬进自身；退出时反向换回。
+    这样同一批数据里 "\\x1b[?1049h" 之后的字节能立即落进备用缓冲。
+
+    语义对齐 xterm：CSI ?1049 h = 保存光标 + 进入备用屏，CSI ?1049 l =
+    退出备用屏 + 恢复光标；CSI ?47 h/l 只切换缓冲，不保存/恢复光标。
     """
+
+    def __init__(self, columns: int, lines: int, history: int = 5000):
+        super().__init__(columns, lines, history=history)
+        self._alt = None          # 备用缓冲（pyte.Screen）
+        self._main_snapshot = None  # 处于备用屏时的主屏状态快照
+
+    # ---- alt-screen ----
+
+    def is_alt_active(self) -> bool:
+        return self._main_snapshot is not None
+
+    def _enter_alt(self, preserve_cursor: bool) -> None:
+        if self.is_alt_active():
+            return
+        if self._alt is None:
+            self._alt = pyte.Screen(self.columns, self.lines)
+        else:
+            self._alt.resize(self.lines, self.columns)
+        # 47（不带 1048/1049）语义：光标位置在两个缓冲间共享
+        main_cursor = (self.cursor.y, self.cursor.x)
+        self._main_snapshot = self._snapshot_state()
+        self._restore_state(self._snapshot_of(self._alt))
+        if preserve_cursor:
+            self.cursor.y = min(main_cursor[0], self.lines - 1)
+            self.cursor.x = min(main_cursor[1], self.columns - 1)
+
+    def _exit_alt(self, preserve_cursor: bool) -> None:
+        if not self.is_alt_active():
+            return
+        # 47 语义：退出时把备用屏的光标位置带回主屏
+        alt_cursor = (self.cursor.y, self.cursor.x)
+        alt_snap = self._snapshot_state()
+        self._restore_state(self._main_snapshot)
+        self._main_snapshot = None
+        for f in _SCREEN_STATE_FIELDS:
+            setattr(self._alt, f, alt_snap[f])
+        # 备用屏期间窗口尺寸可能变过：把主屏恢复到当前尺寸
+        if self.columns != alt_snap["columns"] or self.lines != alt_snap["lines"]:
+            pyte.HistoryScreen.resize(self, alt_snap["lines"],
+                                      alt_snap["columns"])
+        if preserve_cursor:
+            self.cursor.y = min(alt_cursor[0], self.lines - 1)
+            self.cursor.x = min(alt_cursor[1], self.columns - 1)
+
+    @staticmethod
+    def _snapshot_of(screen) -> dict:
+        # history 只在 HistoryScreen（主屏）上存在；备用 pyte.Screen 没有
+        return {f: getattr(screen, f, None) for f in _SCREEN_STATE_FIELDS}
+
+    def _snapshot_state(self) -> dict:
+        return {f: getattr(self, f) for f in _SCREEN_STATE_FIELDS}
+
+    def _restore_state(self, snap: dict) -> None:
+        for f, v in snap.items():
+            setattr(self, f, v)
+
+    def set_mode(self, *modes, **kwargs):
+        private = kwargs.get("private")
+        with_cursor = False
+        if private:
+            for m in modes:
+                if m in (47, 1049):
+                    with_cursor = with_cursor or m == 1049
+        if not self.is_alt_active():
+            if with_cursor:
+                self.save_cursor()
+            if 47 in modes or 1049 in modes:
+                self._enter_alt(preserve_cursor=not with_cursor)
+        super().set_mode(*modes, **kwargs)
+
+    def reset_mode(self, *modes, **kwargs):
+        private = kwargs.get("private")
+        with_cursor = False
+        if private:
+            for m in modes:
+                if m in (47, 1049):
+                    with_cursor = with_cursor or m == 1049
+        exited = False
+        if self.is_alt_active():
+            self._exit_alt(preserve_cursor=not with_cursor)
+            exited = True
+        super().reset_mode(*modes, **kwargs)
+        if exited and with_cursor:
+            self.restore_cursor()
 
     def erase_in_display(self, how=0, *args, **kwargs):
         super().erase_in_display(how, *args, **kwargs)
-        if how in (2, 3):
+        if how in (2, 3) and getattr(self, "history", None) is not None:
             self.history.top.clear()
             self.history.bottom.clear()
             self.history = self.history._replace(position=self.history.size)
+
+    def before_event(self, event):
+        # 备用屏幕（history=None）时没有历史缓冲可释放/收集
+        if getattr(self, "history", None) is None:
+            return
+        super().before_event(event)
+
+    def after_event(self, event):
+        # 备用屏幕（history=None）滚动时不能做历史缓冲收集；
+        # 只保留 dirty 标记，行为对齐无滚动回看的终端。
+        if getattr(self, "history", None) is None:
+            self.dirty.add(event)
+            return
+        super().after_event(event)
 
 
 class TerminalWidget(QWidget):
@@ -123,6 +255,14 @@ class TerminalWidget(QWidget):
         self._cursor_blink.setInterval(_BLINK_MS)
         self._cursor_blink.timeout.connect(self._blink)
 
+        # 搜索状态
+        self._search_text = ""
+        self._search_ranges = {}        # 绝对行 -> {列集合}（命中高亮）
+        self._search_order = []         # [(绝对行, 起始列)] 按视觉顺序
+        self._search_index = -1
+        self._search_cur = None         # (绝对行, 起始列) 当前命中
+        self._build_search_bar()
+
         # 右侧滚动条：value 0 = 回看顶部，maximum = 底部（跟随最新输出）
         self._scrollbar = QScrollBar(Qt.Vertical, self)
         self._scrollbar.setSingleStep(1)
@@ -151,6 +291,8 @@ class TerminalWidget(QWidget):
         self._sync_scrollbar()
         if at_bottom:
             sb.setValue(sb.maximum())
+        if self._search_text:
+            self._recompute_search()
         self.update()
 
     def set_local_echo(self, on: bool) -> None:
@@ -190,9 +332,13 @@ class TerminalWidget(QWidget):
     # ---------------- 内容导出（测试与复制用） ----------------
 
     def _total_lines(self):
-        """滚动缓冲 + 当前屏幕的全部行（历史行是快照引用，不会被后续修改）。"""
-        return list(self._screen.history.top) + [
-            self._screen.buffer[y] for y in range(self._screen.lines)]
+        """滚动缓冲 + 当前屏幕的全部行（历史行是快照引用，不会被后续修改）。
+
+        备用屏幕激活时无滚动历史（history 字段被换走），只返回备用缓冲。
+        """
+        h = getattr(self._screen, "history", None)
+        top = list(h.top) if h is not None else []
+        return top + [self._screen.buffer[y] for y in range(self._screen.lines)]
 
     def _line_str(self, line) -> str:
         parts = []
@@ -201,6 +347,16 @@ class TerminalWidget(QWidget):
             if ch:
                 parts.append(ch)
         return "".join(parts).rstrip()
+
+    @staticmethod
+    def _line_char_cols(line, cols):
+        """行内字符索引 → 单元格列号映射（宽字符占两列，索引只算一次）。"""
+        idx_to_col = []
+        for col in range(cols):
+            ch = line[col].data
+            if ch:
+                idx_to_col.append(col)
+        return idx_to_col
 
     def toPlainText(self) -> str:
         return "\n".join(self._line_str(line) for line in self._total_lines())
@@ -237,13 +393,210 @@ class TerminalWidget(QWidget):
             self._selection = (0, 0, 0, 0)
         self.update()
 
-    def _paste_clipboard(self) -> None:
-        text = QApplication.clipboard().text()
-        if text:
-            self.dataSent.emit(text.encode("utf-8"))
-
     def _has_selection(self) -> bool:
         return self._selection is not None
+
+    # ---------------- 括号粘贴 ----------------
+
+    def paste_text(self, text: str) -> None:
+        """以括号粘贴模式发送文本：\\x1b[200~ … \\x1b[201~ 包裹。
+
+        支持 bracketed paste 的 shell（bash/zsh 等）会把整段内容当作一次
+        粘贴处理，而不是逐行回车执行 —— 避免多行粘贴被当作命令执行。
+        """
+        if not text:
+            return
+        self.dataSent.emit(b"\x1b[200~" + text.encode("utf-8") + b"\x1b[201~")
+
+    def _paste_clipboard(self) -> None:
+        self.paste_text(QApplication.clipboard().text())
+
+    # ---------------- 终端内搜索 ----------------
+
+    def _build_search_bar(self) -> None:
+        bar = QFrame(self)
+        bar.setObjectName("searchBar")
+        bar.setStyleSheet(
+            "#searchBar { background: #252526; border: 1px solid #3c3c3c;"
+            " border-radius: 4px; }"
+            " QLineEdit { background: #333333; color: #d4d4d4;"
+            " border: 1px solid #4a4a4a; border-radius: 3px; padding: 2px 6px; }"
+            " QPushButton { background: transparent; color: #c8c8c8;"
+            " border: none; padding: 2px 6px; }"
+            " QPushButton:hover { color: #ffffff; }"
+            " QLabel { color: #909090; }")
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(6, 3, 6, 3)
+        lay.setSpacing(4)
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText("搜索终端输出…")
+        self._search_count = QLabel("0/0")
+        prev_btn = QPushButton("↑")
+        prev_btn.setToolTip("上一个 (Shift+Enter)")
+        next_btn = QPushButton("↓")
+        next_btn.setToolTip("下一个 (Enter)")
+        close_btn = QPushButton("✕")
+        close_btn.setToolTip("关闭 (Esc)")
+        lay.addWidget(self._search_edit, 1)
+        lay.addWidget(self._search_count)
+        lay.addWidget(prev_btn)
+        lay.addWidget(next_btn)
+        lay.addWidget(close_btn)
+        self._search_bar = bar
+        self._search_bar.hide()
+        self._search_edit.textChanged.connect(self._on_search_text_changed)
+        self._search_edit.returnPressed.connect(lambda: self._goto_match(1))
+        prev_btn.clicked.connect(lambda: self._goto_match(-1))
+        next_btn.clicked.connect(lambda: self._goto_match(1))
+        close_btn.clicked.connect(self.close_search)
+
+    def _show_search(self) -> None:
+        self._search_bar.show()
+        self._search_bar.raise_()
+        self._place_search_bar()
+        self._search_edit.setFocus()
+        self._search_edit.selectAll()
+
+    def _place_search_bar(self) -> None:
+        w = min(360, max(220, self.width() - 16))
+        self._search_bar.setGeometry(self.width() - w - 8, 6, w,
+                                     self._search_bar.sizeHint().height())
+
+    def _on_search_text_changed(self, text: str) -> None:
+        self.search(text)
+
+    def search(self, text: str) -> int:
+        """按文本搜索（不区分大小写），跳转到第一个命中，返回命中数。"""
+        self._search_text = text
+        self._recompute_search()
+        if self._search_order:
+            self._search_index = 0
+            self._search_cur = self._search_order[0]
+            self._scroll_to_line(self._search_cur[0])
+        else:
+            self._search_index = -1
+            self._search_cur = None
+        self._update_search_count()
+        self.update()
+        return len(self._search_order)
+
+    def search_count(self) -> int:
+        return len(self._search_order)
+
+    def search_index(self) -> int:
+        """当前命中序号（0 起；无命中时为 -1）。"""
+        return self._search_index
+
+    def _recompute_search(self) -> None:
+        needle = self._search_text.lower()
+        if not needle:
+            self._search_ranges = {}
+            self._search_order = []
+            return
+        ranges, order = {}, []
+        for abs_line, line in enumerate(self._total_lines()):
+            s = self._line_str(line)
+            if not s:
+                continue
+            ls = s.lower()
+            idx_to_col = self._line_char_cols(line, self._cols)
+            cols = set()
+            start = 0
+            while True:
+                i = ls.find(needle, start)
+                if i < 0:
+                    break
+                for ci in range(i, i + len(needle)):
+                    if ci < len(idx_to_col):
+                        cols.add(idx_to_col[ci])
+                order.append((abs_line, idx_to_col[i]))
+                start = i + 1
+            if cols:
+                ranges[abs_line] = cols
+        # 宽字符占两列：命中列若落在宽字符的占位列，占位列无需高亮，
+        # 但上一列（宽字符首列）已包含；直接保留即可。
+        self._search_ranges = ranges
+        self._search_order = order
+        self._update_search_count()
+
+    def _update_search_count(self) -> None:
+        total = len(self._search_order)
+        cur = self._search_index + 1 if self._search_index >= 0 else 0
+        self._search_count.setText(f"{cur}/{total}")
+
+    def next_match(self) -> None:
+        self._goto_match(1)
+
+    def prev_match(self) -> None:
+        self._goto_match(-1)
+
+    def _goto_match(self, delta: int) -> None:
+        if not self._search_order:
+            return
+        n = len(self._search_order)
+        self._search_index = (self._search_index + delta) % n
+        self._search_cur = self._search_order[self._search_index]
+        self._scroll_to_line(self._search_cur[0])
+        self._update_search_count()
+        self.update()
+
+    def _scroll_to_line(self, abs_line: int) -> None:
+        sb = self._scrollbar
+        vis = max(1, self._rows - 1)
+        sb.setValue(max(0, min(sb.maximum(), abs_line - vis // 2)))
+
+    def close_search(self) -> None:
+        self._search_text = ""
+        self._search_ranges = {}
+        self._search_order = []
+        self._search_index = -1
+        self._search_cur = None
+        self._search_bar.hide()
+        self.setFocus()
+        self.update()
+
+    def _search_active(self) -> bool:
+        return bool(self._search_text) and self._search_bar.isVisible()
+
+    # ---------------- URL 检测 ----------------
+
+    def _urls_on_line(self, line, cols):
+        """返回 [(url, 起始列, 结束列)]。字符索引经 _line_char_cols 映射到列。"""
+        s = self._line_str(line)
+        if not s:
+            return []
+        idx_to_col = self._line_char_cols(line, cols)
+        out = []
+        for m in _URL_RE.finditer(s):
+            url = m.group(0)
+            if url[-1] in _URL_TRAIL:
+                url = url.rstrip(_URL_TRAIL)
+                if not url:
+                    continue
+            end = m.start() + len(url)
+            c0 = idx_to_col[m.start()]
+            c1 = idx_to_col[end - 1]
+            ch = line[c1].data
+            w = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+            out.append((url, c0, c1 + w))
+        return out
+
+    def url_at(self, row: int, col: int):
+        """返回 (row, col) 处的 URL 字符串；无则返回 None。"""
+        total = self._total_lines()
+        if not (0 <= row < len(total)):
+            return None
+        for url, c0, c1 in self._urls_on_line(total[row], self._cols):
+            if c0 <= col < c1:
+                return url
+        return None
+
+    @staticmethod
+    def _open_url(url: str) -> None:
+        try:
+            QDesktopServices.openUrl(QUrl(url))
+        except Exception:
+            pass
 
     # ---------------- 绘制 ----------------
 
@@ -303,6 +656,8 @@ class TerminalWidget(QWidget):
         x = 0.0
         col = 0
         cols = self._cols
+        srch_cols = self._search_ranges.get(abs_line)
+        cur_line, cur_col = self._search_cur or (None, None)
         while col < cols:
             cell = line[col]
             ch = cell.data
@@ -319,8 +674,14 @@ class TerminalWidget(QWidget):
             wide = unicodedata.east_asian_width(ch) in ("W", "F")
             w = 2 if wide else 1
             width = w * self._cw
+            is_cur = (abs_line, col) == (cur_line, cur_col)
+            is_match = srch_cols is not None and col in srch_cols
             if self._in_selection(abs_line, col):
                 fg, bg = bg, fg
+            if is_cur:
+                fg, bg = QColor("#1e1e1e"), _SEARCH_CUR_BG
+            elif is_match:
+                fg, bg = QColor("#e8e8e8"), _SEARCH_BG
             if bg != _BG:
                 p.fillRect(QRectF(x, row * self._ch, width, self._ch), bg)
             p.setPen(fg)
@@ -369,7 +730,8 @@ class TerminalWidget(QWidget):
         return self._scrollbar
 
     def _sync_scrollbar(self) -> None:
-        total = len(self._screen.history.top) + self._rows
+        h = getattr(self._screen, "history", None)
+        total = (len(h.top) if h is not None else 0) + self._rows
         vis = self._rows
         sb = self._scrollbar
         sb.blockSignals(True)
@@ -391,14 +753,46 @@ class TerminalWidget(QWidget):
         return (self._scrollbar.value() + max(0, line),
                 max(0, min(col, self._cols - 1)))
 
+    def _url_under(self, pos):
+        l, c = self._cell_at(pos)
+        return self.url_at(l, c)
+
     def mousePressEvent(self, e) -> None:
         self.setFocus()
+        if e.button() == Qt.LeftButton and e.modifiers() & Qt.ControlModifier:
+            url = self._url_under(e.pos())
+            if url:
+                self._open_url(url)
+                return
         if e.button() == Qt.LeftButton:
             l, c = self._cell_at(e.pos())
             self._selection = (l, c, l, c)
             self.update()
         elif e.button() == Qt.MiddleButton:
             self._paste_clipboard()
+        elif e.button() == Qt.RightButton:
+            self._context_menu(e.globalPos())
+
+    def _context_menu(self, global_pos) -> None:
+        menu = QMenu(self)
+        url = self._url_under(self.mapFromGlobal(global_pos))
+        if url:
+            open_act = QAction("打开链接", self)
+            open_act.triggered.connect(lambda: self._open_url(url))
+            copy_act = QAction("复制链接", self)
+            copy_act.triggered.connect(
+                lambda: QApplication.clipboard().setText(url))
+            menu.addAction(open_act)
+            menu.addAction(copy_act)
+            menu.addSeparator()
+        if self._has_selection():
+            copy_act = QAction("复制", self)
+            copy_act.triggered.connect(self.copy)
+            menu.addAction(copy_act)
+        paste_act = QAction("粘贴（括号模式）", self)
+        paste_act.triggered.connect(self._paste_clipboard)
+        menu.addAction(paste_act)
+        menu.exec_(global_pos)
 
     def mouseMoveEvent(self, e) -> None:
         if self._selection is not None and e.buttons() & Qt.LeftButton:
@@ -416,6 +810,14 @@ class TerminalWidget(QWidget):
 
     def keyPressEvent(self, e) -> None:
         mods = e.modifiers()
+        # Ctrl+F：终端内搜索
+        if mods & Qt.ControlModifier and e.key() == Qt.Key_F:
+            self._show_search()
+            return
+        # Esc：搜索条打开时优先关闭搜索，否则发送 ESC 序列
+        if e.key() == Qt.Key_Escape and self._search_bar.isVisible():
+            self.close_search()
+            return
         # Ctrl+C：有选中文本则复制，否则发送中断信号 \x03
         if mods & Qt.ControlModifier and e.key() == Qt.Key_C:
             if self._has_selection():
@@ -501,6 +903,7 @@ class TerminalWidget(QWidget):
             self.width() - self._scrollbar.sizeHint().width(), 0,
             self._scrollbar.sizeHint().width(), self.height())
         self.update_pty_size()
+        self._place_search_bar()
 
     def showEvent(self, e) -> None:
         super().showEvent(e)

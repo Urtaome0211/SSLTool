@@ -16,7 +16,7 @@ from app.ui.connect_dialog import ConnectDialog
 from app.ui.terminal_tab import ConsoleTab
 from app.ui.sftp_tab import SFTPTab
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "2.0.0"
 
 
 class MainWindow(QMainWindow):
@@ -162,8 +162,9 @@ class MainWindow(QMainWindow):
         sub.setAlignment(Qt.AlignCenter)
         feats = QLabel(
             "• SSH 终端 —— 密码或私钥登录，ANSI 彩色输出\n"
-            "• SSL 加密通道 —— 原始 TLS 控制台，显示证书指纹\n"
-            "• SFTP 文件管理 —— 上传 / 下载 / 重命名 / 删除")
+            "• SSL 加密通道 —— 原始 TLS 控制台，显示证书详情\n"
+            "• SFTP 文件管理 —— 上传 / 下载 / 重命名 / 删除\n"
+            "• 终端体验 —— 会话日志 / Ctrl+F 搜索 / URL 点击 / 括号粘贴 / 备用屏幕")
         feats.setObjectName("welcomeFeats")
         feats.setAlignment(Qt.AlignCenter)
         hint = QLabel("在左侧输入主机地址开始连接，或选择一个已保存的会话。")

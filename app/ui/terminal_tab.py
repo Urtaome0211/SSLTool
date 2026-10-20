@@ -4,6 +4,7 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame,
                              QPushButton, QCheckBox)
 
 from app.core.workers import SSHWorker, SSLWorker
+from app.core.session_log import SessionLog
 from app.ui.hostkey_dialog import (confirm_changed_host_key,
                                    confirm_unknown_host_key)
 from app.ui.terminal_widget import TerminalWidget
@@ -15,7 +16,9 @@ class ConsoleTab(QWidget):
     def __init__(self, name: str, params: dict, parent=None):
         super().__init__(parent)
         self._params = params
+        self._name = name
         self.worker = None
+        self._log = None  # SessionLog；日志是增值功能，任何异常都不影响终端
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -37,6 +40,11 @@ class ConsoleTab(QWidget):
         self._echo.setToolTip(
             "在本地直接显示键入内容，并自动去除服务器的重复回显。\n"
             "若显示仍有异常，可取消勾选，完全依赖服务器回显。")
+        self._log_chk = QCheckBox("会话日志")
+        self._log_chk.setChecked(True)
+        self._log_chk.setToolTip(
+            "把会话输出记录到 ~/.ssltool/logs/ 下的日志文件。\n"
+            "取消勾选后新会话不再记录。")
         reconnect_btn = QPushButton("重新连接")
         reconnect_btn.setObjectName("secondary")
         close_btn = QPushButton("关闭")
@@ -44,6 +52,7 @@ class ConsoleTab(QWidget):
         h.addWidget(name_label)
         h.addWidget(self._status)
         h.addWidget(self._echo)
+        h.addWidget(self._log_chk)
         h.addStretch(1)
         h.addWidget(reconnect_btn)
         h.addWidget(close_btn)
@@ -55,10 +64,35 @@ class ConsoleTab(QWidget):
         reconnect_btn.clicked.connect(self._reconnect)
         close_btn.clicked.connect(lambda: self.tabClosed.emit(self))
         self._echo.toggled.connect(self.terminal.set_local_echo)
+        self._log_chk.toggled.connect(self._on_log_toggled)
         self.terminal.dataSent.connect(self._on_data_sent)
         self.terminal.ptySizeChanged.connect(self._on_pty_size)
 
         self._create_worker()
+
+    # ---------------- 会话日志 ----------------
+
+    @property
+    def log_path(self):
+        """当前日志文件路径（未启用或无日志时 None）。测试用。"""
+        return self._log.path if self._log else None
+
+    def _open_log(self):
+        p = self._params
+        self._log = SessionLog(self._name, p["host"], int(p["port"]),
+                               user=p.get("username", ""))
+
+    def _close_log(self):
+        if self._log:
+            self._log.close()
+            self._log = None
+
+    def _on_log_toggled(self, on: bool):
+        if on:
+            if not self._log:
+                self._open_log()
+        else:
+            self._close_log()
 
     # ---------------- worker 生命周期 ----------------
 
@@ -75,7 +109,7 @@ class ConsoleTab(QWidget):
                           passphrase=p.get("passphrase"),
                           forwards=p.get("forwards"))
         w.connected.connect(self._on_connected)
-        w.dataReceived.connect(self.terminal.feed_remote)
+        w.dataReceived.connect(self._on_data)
         w.error.connect(self._on_error)
         w.disconnected.connect(self._on_disconnected)
         if isinstance(w, SSLWorker):
@@ -89,9 +123,12 @@ class ConsoleTab(QWidget):
 
     def start(self):
         self._set_status("连接中…", "#909399")
+        if self._log_chk.isChecked() and not self._log:
+            self._open_log()
         self.worker.start()
 
     def shutdown(self):
+        self._close_log()
         if self.worker:
             w = self.worker
             self.worker = None
@@ -100,6 +137,7 @@ class ConsoleTab(QWidget):
                 w.finished.connect(w.deleteLater)
 
     def _reconnect(self):
+        self._close_log()
         if self.worker:
             old = self.worker
             self.worker = None
@@ -116,17 +154,28 @@ class ConsoleTab(QWidget):
         self._status.setText(text)
         self._status.setStyleSheet(f"color: {color};")
 
+    def _on_data(self, data: bytes):
+        self.terminal.feed_remote(data)
+        if self._log:
+            self._log.write(data)
+
     def _on_connected(self):
         self._set_status("已连接", "#67c23a")
+        if self._log:
+            self._log.note("已连接")
         self.terminal.update_pty_size(force=True)
 
     def _on_error(self, msg):
         self._set_status(msg, "#f56c6c")
+        if self._log:
+            self._log.note(f"错误: {msg}")
         self.terminal.feed(("\r\n[" + msg + "]\r\n").encode("utf-8"))
 
     def _on_disconnected(self, reason):
         text = "已断开" + (f": {reason}" if reason else "")
         self._set_status(text, "#909399")
+        if self._log:
+            self._log.note(text)
 
     def _on_cert_info(self, text):
         self.terminal.feed(("\r\n" + text + "\r\n").encode("utf-8"))

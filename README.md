@@ -4,7 +4,8 @@
 
 ## 功能
 
-- **SSH 终端**：密码 / 私钥登录，基于 pyte 的完整 VT100/VT220 终端（ANSI 彩色、vim / less 等可用），本地回显自动去重
+- **SSH 终端**：密码 / 私钥登录，基于 pyte 的完整 VT100/VT220 终端（ANSI 彩色），支持备用屏幕（`vim` / `less` / `top` 等全屏程序正常显示），本地回显自动去重
+- **终端体验增强**：会话日志（自动保存到 `~/.ssltool/logs/`，带时间戳，标签页内可开关）、终端内搜索（Ctrl+F）、URL 识别（Ctrl+点击用浏览器打开，右键菜单可复制 / 打开）、括号粘贴（多行粘贴作为一个整体安全发送，防止逐行被当作命令执行）
 - **SSL 加密通道**：原始 TLS 文本控制台（类似 telnet-over-TLS），连接后显示服务器证书 SHA-256 指纹、TLS 版本与加密套件；可选证书验证与客户端证书
 - **SFTP 文件管理**：目录浏览、上传 / 下载（支持文件夹递归与总进度）、**拖拽上传 / 下载**、**传输可取消**、新建文件夹、重命名、删除
 - **SSH 端口转发**：本地转发（-L）、远程转发（-R）、动态 SOCKS5 代理（-D），会话配置里一行一条规则；连接后启动结果直接显示在终端里
@@ -50,7 +51,9 @@
 | --- | --- |
 | Ctrl+C | 发送中断信号 `\x03`（有选中文本时复制） |
 | Ctrl+Shift+C | 复制选中文本 |
-| Ctrl+V / Ctrl+Shift+V | 粘贴并发送 |
+| Ctrl+V / Ctrl+Shift+V | 粘贴并发送（自动括号粘贴） |
+| Ctrl+F | 终端内搜索（Enter 下一个，Shift+Enter 上一个，Esc 关闭） |
+| Ctrl+点击 URL | 用系统浏览器打开链接 |
 | Ctrl+A | 全选 |
 | 方向键 / Home / End / Ins / Del | 发送对应转义序列 |
 | PgUp / PgDn | 回看滚动缓冲 |
@@ -58,7 +61,7 @@
 
 ## 说明与限制
 
-- 终端基于 pyte 的 VT100/VT220 模拟：支持 xterm 16/256 色、粗体 / 下划线 / 反显、滚动缓冲；不支持备用屏幕（alt-screen，`vim` 等全屏程序在主屏幕缓冲中运行，可正常使用，仅外观略有折损）
+- 终端基于 pyte 的 VT100/VT220 模拟：支持 xterm 16/256 色、粗体 / 下划线 / 反显、滚动缓冲，以及备用屏幕（alt-screen，1049 / 47 模式——`vim`、`less`、`top` 等全屏程序在独立屏幕缓冲中运行，退出后自动恢复主屏）
 - SSH 主机密钥采用「首次使用信任（TOFU）」策略：首次连接需人工确认指纹，密钥变化时警告（详见「安全」一节）；确认记录保存于 `~/.ssltool/known_hosts.json`
 - 端口转发规则不支持 IPv6 字面量地址；SOCKS5 仅支持 CONNECT 命令与无认证模式
 
@@ -76,16 +79,17 @@ SSLTool/
 │   │   ├── workers.py         # SSH / SSL 连接线程（含证书详情）
 │   │   ├── forwarders.py      # SSH 端口转发（-L / -R / -D SOCKS5）
 │   │   ├── hostkey.py         # 主机密钥 TOFU 探测 / 校验 / known_hosts 存储
+│   │   ├── session_log.py     # 会话日志（logs 目录、时间戳文件名）
 │   │   └── sftp_worker.py     # SFTP 连接线程
 │   └── ui/
-│       ├── terminal_widget.py # pyte 完整 VT 终端组件
+│       ├── terminal_widget.py # pyte 完整 VT 终端组件（备用屏幕 / 搜索 / URL / 括号粘贴）
 │       ├── terminal_tab.py    # 终端 / SSL 控制台标签页
 │       ├── sftp_tab.py        # SFTP 文件管理标签页（拖拽 / 可取消）
 │       ├── hostkey_dialog.py  # 主机密钥确认 / 变更警告对话框
 │       ├── connect_dialog.py  # 新建 / 编辑连接对话框
 │       └── main_window.py     # 主窗口
 └── tests/
-    ├── smoke_test.py          # 离屏冒烟测试（44 项）
+    ├── smoke_test.py          # 离屏冒烟测试（72 项）
     ├── gui_boot.py            # 主窗口启动自检
-    └── e2e_test.py            # 内置 SSH 服务器端到端测试（回显 / 去重 / 滚动 / 对话框 / 端口转发 / TOFU）
+    └── e2e_test.py            # 内置 SSH 服务器端到端测试（回显 / 去重 / 滚动 / 对话框 / 端口转发 / TOFU / 终端体验）
 ```

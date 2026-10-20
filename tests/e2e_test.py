@@ -128,6 +128,8 @@ class EchoServer(paramiko.ServerInterface):
     spam = False       # 类属性开关：持续向会话灌数据（模拟繁忙服务器）
     never_echo = False  # 类属性开关：无论请求与否都不回显（模拟不回显的设备）
     auth_attempts = 0   # 类属性：累计认证尝试次数（TOFU 拒绝路径验证用）
+    record_data = False  # 类属性开关：记录客户端发来的原始字节（粘贴验证用）
+    received = []       # record_data 开启时收集的原始字节
 
     def __init__(self):
         self.echo = False
@@ -173,6 +175,8 @@ class EchoServer(paramiko.ServerInterface):
                     data = chan.recv(1024)
                     if not data:
                         break
+                    if EchoServer.record_data:
+                        EchoServer.received.append(data)
                     if self.echo:
                         chan.send(data)
         except Exception:
@@ -748,15 +752,97 @@ def test_host_key_tofu():
     print("[PASS] test_host_key_tofu: 未知确认/变更警告/拒绝不泄凭据 全部正常")
 
 
+def test_terminal_experience():
+    """V2.0 终端体验端到端：会话日志、备用屏幕（ESC 序列真实往返）、括号粘贴。"""
+    port = _start_server()
+    params = config.make_session(protocol="ssh", host="127.0.0.1", port=port,
+                                 username="tester", name="e2e-term",
+                                 auth="password", password="pw")
+    tab = ConsoleTab(params["name"], params)
+    tab.show()
+    tab.start()
+    connected = _wait_for(lambda: tab._status.text() == "已连接", timeout=20.0)
+    if not connected:
+        tab.shutdown()
+        raise AssertionError("SSH 未能连接到内嵌服务器")
+    _wait_for(lambda: "$ " in tab.terminal.toPlainText(), timeout=5.0)
+    time.sleep(0.3)
+
+    # (1) 会话日志：文件已创建且包含服务器原始输出
+    lp = tab.log_path
+    assert lp and os.path.isfile(lp), "会话日志文件应存在: %r" % lp
+    with open(lp, encoding="utf-8") as f:
+        logtext = f.read()
+    assert "Welcome to SSLTool test sshd" in logtext, "日志应含服务器欢迎语"
+
+    EchoServer.record_data = True
+    EchoServer.received = []
+    try:
+        # (2) 备用屏幕：ESC [?1049h / [?1049l 经真实 SSH 通道往返
+        QApplication.sendEvent(tab.terminal,
+                               QKeyEvent(QEvent.KeyPress, Qt.Key_Escape,
+                                         Qt.NoModifier))
+        for ch in "[?1049h":
+            QApplication.sendEvent(tab.terminal,
+                                   QKeyEvent(QEvent.KeyPress, 0,
+                                             Qt.NoModifier, ch))
+        ok = _wait_for(lambda: tab.terminal._screen.is_alt_active(),
+                       timeout=5.0)
+        assert ok, "1049h 应进入备用屏幕"
+        assert "Welcome to SSLTool test sshd" not in tab.terminal.toPlainText(), \
+            "备用屏幕不应显示主屏内容"
+        for ch in "vim-mode":
+            QApplication.sendEvent(tab.terminal,
+                                   QKeyEvent(QEvent.KeyPress, 0,
+                                             Qt.NoModifier, ch))
+        assert _wait_for(lambda: "vim-mode" in tab.terminal.toPlainText(),
+                         timeout=3.0), "备用屏幕应显示新键入内容"
+        QApplication.sendEvent(tab.terminal,
+                               QKeyEvent(QEvent.KeyPress, Qt.Key_Escape,
+                                         Qt.NoModifier))
+        for ch in "[?1049l":
+            QApplication.sendEvent(tab.terminal,
+                                   QKeyEvent(QEvent.KeyPress, 0,
+                                             Qt.NoModifier, ch))
+        ok = _wait_for(lambda: not tab.terminal._screen.is_alt_active(),
+                       timeout=5.0)
+        assert ok, "1049l 应退出备用屏幕"
+        text = tab.terminal.toPlainText()
+        assert "Welcome to SSLTool test sshd" in text, "退出后主屏应恢复"
+        assert "vim-mode" not in text, "备用屏内容不应泄漏到主屏"
+
+        # (3) 括号粘贴：服务端收到的原始字节被 200~/201~ 包裹
+        QApplication.clipboard().setText("paste-content")
+        EchoServer.received = []
+        tab.terminal._paste_clipboard()
+        ok = _wait_for(
+            lambda: any(b"\x1b[200~" in d for d in EchoServer.received),
+            timeout=5.0)
+        assert ok, "服务端应收到括号粘贴包裹的数据: %r" % (EchoServer.received,)
+        wrapped = [d for d in EchoServer.received if b"\x1b[200~" in d]
+        assert any(d.rstrip().endswith(b"\x1b[201~") for d in wrapped), \
+            "粘贴数据应以 \\x1b[201~ 结尾"
+        assert any(b"paste-content" in d for d in wrapped), \
+            "服务端应收到粘贴内容"
+    finally:
+        EchoServer.record_data = False
+        EchoServer.received = []
+    tab.shutdown()
+    print("[PASS] test_terminal_experience: 会话日志/备用屏幕/括号粘贴 全部正常")
+
+
 def main():
     app = QApplication.instance() or QApplication([])
     tests = [test_ssh_echo, test_new_session_while_connected,
              test_dialog_visibility, test_local_echo, test_echo_suppression,
-             test_scroll_follow, test_port_forwarding, test_host_key_tofu]
+             test_scroll_follow, test_port_forwarding, test_host_key_tofu,
+             test_terminal_experience]
     for fn in tests:
         # 每个测试前复位服务器开关，防止前一测试的类属性状态污染
         EchoServer.spam = False
         EchoServer.never_echo = False
+        EchoServer.record_data = False
+        EchoServer.received = []
         try:
             fn()
         except Exception as e:

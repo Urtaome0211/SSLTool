@@ -83,6 +83,86 @@ check("Ctrl+C 发送中断 \\x03", sent[-1] == b"\x03")
 term.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Up, Qt.NoModifier, ""))
 check("方向键发送 ESC 序列", sent[-1] == b"\x1b[A")
 
+# ---------- 2b. 终端体验（备用屏幕 / 括号粘贴 / 搜索 / URL） ----------
+# 备用屏幕：1049 保存/恢复光标，47 只切换缓冲
+alt = TerminalWidget()
+alt.feed(b"main-one\r\nmain-two\r\n")
+alt.feed(b"\x1b[2;5H")                 # 光标移到第 2 行第 6 列（0-based: y=1, x=4）
+alt.feed(b"\x1b[?1049h")
+check("1049h 进入备用屏幕", alt._screen.is_alt_active())
+check("备用屏幕隐藏主屏内容", "main-one" not in alt.toPlainText())
+alt.feed(b"\x1b[Halt-line")
+check("备用屏幕显示新内容", "alt-line" in alt.toPlainText())
+alt.feed(b"\x1b[?1049l")
+check("1049l 退出备用屏幕", not alt._screen.is_alt_active())
+check("退出后主屏内容恢复", "main-one" in alt.toPlainText()
+      and "alt-line" not in alt.toPlainText())
+check("1049 保存并恢复光标位置",
+      (alt._screen.cursor.y, alt._screen.cursor.x) == (1, 4))
+
+alt2 = TerminalWidget()
+alt2.feed(b"main-content\r\n")
+alt2.feed(b"\x1b[?47h")
+check("47h 进入备用屏幕", alt2._screen.is_alt_active())
+alt2.feed(b"X")
+alt2.feed(b"\x1b[?47l")
+check("47l 退出备用屏幕", not alt2._screen.is_alt_active())
+check("47 模式恢复主屏且不恢复光标", "main-content" in alt2.toPlainText()
+      and "X" not in alt2.toPlainText()
+      and (alt2._screen.cursor.y, alt2._screen.cursor.x) == (1, 1))
+
+alt3 = TerminalWidget()
+alt3.feed(b"keep-me\r\n")
+alt3.feed(b"\x1b[?1049h\x1b[2Jalt-content")
+check("备用屏幕内 CSI 2J 清屏不崩溃", "alt-content" in alt3.toPlainText())
+alt3.feed(b"\x1b[?1049l")
+check("退出后主屏未被备用屏清屏影响", "keep-me" in alt3.toPlainText())
+
+# 括号粘贴
+paste_sent = []
+alt.dataSent.connect(lambda b: paste_sent.append(b))
+alt.paste_text("ls -la\necho hi")
+check("粘贴包裹 \\x1b[200~ / \\x1b[201~",
+      paste_sent[-1] == b"\x1b[200~ls -la\necho hi\x1b[201~")
+QApplication.clipboard().setText("clip-text")
+alt._paste_clipboard()
+check("剪贴板粘贴同样包裹",
+      paste_sent[-1] == b"\x1b[200~clip-text\x1b[201~")
+
+# 终端内搜索
+st = TerminalWidget()
+st.resize(600, 300)
+for i in range(60):
+    st.feed(("item-%02d alpha\r\n" % i).encode())
+st.feed(b"needle-42 omega\r\n")
+for i in range(40):
+    st.feed(("tail-%02d\r\n" % i).encode())
+n = st.search("needle-42")
+check("搜索单次命中计数", n == 1)
+sb = st.verticalScrollBar()
+check("搜索跳转到命中行", sb.value() <= 61 < sb.value() + st._rows)
+n = st.search("alpha")
+check("搜索多次命中计数", n == 60)
+check("命中定位到第一个", st.search_index() == 0)
+st.next_match()
+check("下一个命中", st.search_index() == 1)
+st.prev_match()
+check("上一个命中回退", st.search_index() == 0)
+st.prev_match()
+check("上一个命中回绕到末尾", st.search_index() == 59)
+st.close_search()
+check("关闭搜索清空高亮", st.search_count() == 0 and st.search_index() == -1)
+
+# URL 检测
+ut = TerminalWidget()
+ut.feed(b"see http://example.com/a?b=1 and https://x.io/y\r\n")
+check("URL 检测（含查询串）", ut.url_at(0, 5) == "http://example.com/a?b=1")
+check("第二个 URL 检测", ut.url_at(0, 34) == "https://x.io/y")
+check("非 URL 位置返回 None", ut.url_at(0, 1) is None)
+ut.feed(b"go to https://example.com.\r\n")
+check("URL 尾部标点剔除", ut.url_at(1, 8) == "https://example.com"
+      and ut.url_at(1, 25) is None)
+
 # ---------- 3. 会话与凭据存取（文件回退路径） ----------
 tmp = Path(tempfile.mkdtemp())
 config._KEYRING_OK = False
@@ -107,6 +187,24 @@ check("凭据删除", config.get_secret("k") is None)
 config.save_settings({"dark": True})
 check("设置持久化", config.load_settings().get("dark") is True)
 config.save_settings({"dark": False})
+
+# ---------- 3c. 会话日志 ----------
+from app.core.session_log import SessionLog
+
+lg = SessionLog("测试会话/weird name", "127.0.0.1", 22, user="root")
+lg.write(b"echo-data\r\n")
+lg.write("中文输出".encode("utf-8"))
+lg.write(b"\xff\xfe")               # 损坏 UTF-8 → U+FFFD 替换，不抛异常
+lg.note("已连接")
+lg.close()
+log_files = list((tmp / "logs").glob("*.log"))
+check("会话日志文件已创建", len(log_files) == 1)
+content = log_files[0].read_text(encoding="utf-8")
+check("日志含原始输出与事件行",
+      "echo-data" in content and "中文输出" in content
+      and "\ufffd" in content and "已连接" in content
+      and "root@127.0.0.1:22" in content and "会话结束" in content)
+check("日志文件名含安全化会话名", "测试会话_weird_name" in log_files[0].name)
 
 # ---------- 3b. 主机密钥 TOFU 存储 ----------
 import paramiko
