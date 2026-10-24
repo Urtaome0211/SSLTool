@@ -24,28 +24,28 @@ from PyQt5.QtWidgets import (QAction, QApplication, QFrame, QHBoxLayout,
                              QLabel, QLineEdit, QMenu, QPushButton,
                              QScrollBar, QWidget)
 
-# xterm 标准 16 色
+# 黑客帝国（Matrix）风格 16 色：黑底绿字，全色板映射为绿色亮度梯度
 _XTERM16 = [
-    "#000000", "#cd0000", "#00cd00", "#cdcd00",
-    "#0000ee", "#cd00cd", "#00cdcd", "#e5e5e5",
-    "#7f7f7f", "#ff0000", "#00ff00", "#ffff00",
-    "#5c5cff", "#ff00ff", "#00ffff", "#ffffff",
+    "#000000", "#003300", "#006600", "#009900",
+    "#00cc00", "#00e600", "#00ff41", "#66ff99",
+    "#003d00", "#008800", "#00cc00", "#00ff41",
+    "#33ff66", "#66ff99", "#99ffcc", "#e0ffe8",
 ]
 
 # 粗体 + 标准色（前 8 色）→ 对应亮色（VT 惯例；pyte 不自动做此映射）
 _BOLD_BRIGHT = {
-    "000000": "7f7f7f", "cd0000": "ff0000", "00cd00": "00ff00",
-    "cdcd00": "ffff00", "0000ee": "5c5cff", "cd00cd": "ff00ff",
-    "00cdcd": "00ffff", "e5e5e5": "ffffff",
+    "000000": "003d00", "003300": "008800", "006600": "00cc00",
+    "009900": "00ff41", "00cc00": "33ff66", "00e600": "66ff99",
+    "00ff41": "99ffcc", "66ff99": "e0ffe8",
 }
 
-_BG = QColor("#1e1e1e")   # 默认背景
-_FG = QColor("#d4d4d4")   # 默认前景
+_BG = QColor("#000000")   # 默认背景：纯黑
+_FG = QColor("#00ff41")   # 默认前景：黑客帝国绿
 
 _BLINK_MS = 600        # 光标闪烁周期
 
-_SEARCH_BG = QColor("#6b5b00")      # 搜索命中背景
-_SEARCH_CUR_BG = QColor("#f7d700")  # 当前命中背景（更强）
+_SEARCH_BG = QColor("#003d00")      # 搜索命中背景（暗绿）
+_SEARCH_CUR_BG = QColor("#00ff41")  # 当前命中背景（亮绿）
 
 # http(s) 链接（排除空白与常见引号/尖括号；尾部标点单独剔除）
 _URL_RE = re.compile(r"https?://[^\s'\"<>]+")
@@ -62,11 +62,13 @@ def _xterm256(n: int) -> str:
         def v(c):
             return 0 if c == 0 else 55 + c * 40
 
-        return "#{:02x}{:02x}{:02x}".format(v(r), v(g), v(b))
+        # Matrix 风格：按 RGB 亮度映射为绿色，保持明暗对比
+        gv = max(v(r), v(g), v(b))
+        return "#00{:02x}00".format(gv)
     if 232 <= n <= 255:
         g = 8 + (n - 232) * 10
-        return "#{:02x}{:02x}{:02x}".format(g, g, g)
-    return "#d4d4d4"
+        return "#00{:02x}00".format(g)
+    return "#00ff41"
 
 
 def _echo_expect(data: bytes) -> bytes:
@@ -417,14 +419,14 @@ class TerminalWidget(QWidget):
         bar = QFrame(self)
         bar.setObjectName("searchBar")
         bar.setStyleSheet(
-            "#searchBar { background: #252526; border: 1px solid #3c3c3c;"
+            "#searchBar { background: #001a00; border: 1px solid #003d00;"
             " border-radius: 4px; }"
-            " QLineEdit { background: #333333; color: #d4d4d4;"
-            " border: 1px solid #4a4a4a; border-radius: 3px; padding: 2px 6px; }"
-            " QPushButton { background: transparent; color: #c8c8c8;"
+            " QLineEdit { background: #002b00; color: #00ff41;"
+            " border: 1px solid #005c00; border-radius: 3px; padding: 2px 6px; }"
+            " QPushButton { background: transparent; color: #33ff66;"
             " border: none; padding: 2px 6px; }"
-            " QPushButton:hover { color: #ffffff; }"
-            " QLabel { color: #909090; }")
+            " QPushButton:hover { color: #ccffcc; }"
+            " QLabel { color: #66ff99; }")
         lay = QHBoxLayout(bar)
         lay.setContentsMargins(6, 3, 6, 3)
         lay.setSpacing(4)
@@ -679,9 +681,9 @@ class TerminalWidget(QWidget):
             if self._in_selection(abs_line, col):
                 fg, bg = bg, fg
             if is_cur:
-                fg, bg = QColor("#1e1e1e"), _SEARCH_CUR_BG
+                fg, bg = QColor("#000000"), _SEARCH_CUR_BG
             elif is_match:
-                fg, bg = QColor("#e8e8e8"), _SEARCH_BG
+                fg, bg = QColor("#ccffcc"), _SEARCH_BG
             if bg != _BG:
                 p.fillRect(QRectF(x, row * self._ch, width, self._ch), bg)
             p.setPen(fg)
