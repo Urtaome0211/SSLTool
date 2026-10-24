@@ -5,8 +5,9 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QGridLayout, QLabel, QFrame,
                              QLineEdit, QComboBox, QSpinBox, QPushButton,
-                             QListWidget, QListWidgetItem, QTabWidget,
-                             QMessageBox, QInputDialog, QAction, QDialog)
+                             QTreeWidget, QTreeWidgetItem, QTabWidget,
+                             QMessageBox, QInputDialog, QAction, QDialog,
+                             QFileDialog)
 
 import paramiko
 
@@ -16,7 +17,7 @@ from app.ui.connect_dialog import ConnectDialog
 from app.ui.terminal_tab import ConsoleTab
 from app.ui.sftp_tab import SFTPTab
 
-APP_VERSION = "2.0.0"
+APP_VERSION = "3.0.0"
 
 
 class MainWindow(QMainWindow):
@@ -42,6 +43,12 @@ class MainWindow(QMainWindow):
         new_act.setShortcut("Ctrl+N")
         new_act.triggered.connect(self._new_session)
         file_menu.addAction(new_act)
+        import_act = QAction("导入会话…", self)
+        import_act.triggered.connect(self._import_sessions)
+        file_menu.addAction(import_act)
+        export_act = QAction("导出会话…", self)
+        export_act.triggered.connect(self._export_sessions)
+        file_menu.addAction(export_act)
         quit_act = QAction("退出", self)
         quit_act.setShortcut("Ctrl+Q")
         quit_act.triggered.connect(self.close)
@@ -112,9 +119,14 @@ class MainWindow(QMainWindow):
         sessions_label = QLabel("已保存的会话")
         sessions_label.setObjectName("sidebarSectionLabel")
         v.addWidget(sessions_label)
-        self.session_list = QListWidget()
-        self.session_list.setMinimumHeight(120)
-        v.addWidget(self.session_list, 1)
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("搜索会话（名称 / 主机 / 分组）")
+        v.addWidget(self.search_edit)
+        self.session_tree = QTreeWidget()
+        self.session_tree.setHeaderHidden(True)
+        self.session_tree.setRootIsDecorated(True)
+        self.session_tree.setMinimumHeight(120)
+        v.addWidget(self.session_tree, 1)
 
         new_btn = QPushButton("新建连接")
         new_btn.setObjectName("secondary")
@@ -147,8 +159,9 @@ class MainWindow(QMainWindow):
         self.sftp_btn.clicked.connect(self._open_sftp_selected)
         self.edit_btn.clicked.connect(self._edit_selected)
         self.del_btn.clicked.connect(self._delete_selected)
-        self.session_list.itemDoubleClicked.connect(lambda _: self._connect_selected())
-        self.session_list.itemSelectionChanged.connect(self._update_buttons)
+        self.session_tree.itemDoubleClicked.connect(self._on_tree_double_clicked)
+        self.session_tree.itemSelectionChanged.connect(self._update_buttons)
+        self.search_edit.textChanged.connect(self._on_search_changed)
 
     def _build_welcome(self):
         w = QWidget()
@@ -163,8 +176,9 @@ class MainWindow(QMainWindow):
         feats = QLabel(
             "• SSH 终端 —— 密码或私钥登录，ANSI 彩色输出\n"
             "• SSL 加密通道 —— 原始 TLS 控制台，显示证书详情\n"
-            "• SFTP 文件管理 —— 上传 / 下载 / 重命名 / 删除\n"
-            "• 终端体验 —— 会话日志 / Ctrl+F 搜索 / URL 点击 / 括号粘贴 / 备用屏幕")
+            "• SFTP 文件管理 —— 拖拽传输 / 批量下载 / 断点续传 / 只读模式\n"
+            "• 终端体验 —— 会话日志 / Ctrl+F 搜索 / URL 点击 / 括号粘贴 / 备用屏幕\n"
+            "• 连接能力 —— SSH 跳板机 / 会话分组与搜索 / 导入导出")
         feats.setObjectName("welcomeFeats")
         feats.setAlignment(Qt.AlignCenter)
         hint = QLabel("在左侧输入主机地址开始连接，或选择一个已保存的会话。")
@@ -202,22 +216,49 @@ class MainWindow(QMainWindow):
         self._open_console(s)
 
     def _selected_session(self):
-        item = self.session_list.currentItem()
-        return item.data(Qt.UserRole) if item else None
+        item = self.session_tree.currentItem()
+        if item is None:
+            return None
+        return item.data(0, Qt.UserRole)
+
+    def _on_tree_double_clicked(self, item, col):
+        if item.data(0, Qt.UserRole):
+            self._open_console(item.data(0, Qt.UserRole))
+
+    def _on_search_changed(self, text):
+        self._refresh_list(text.strip().lower())
 
     def _update_buttons(self):
         has = self._selected_session() is not None
         for b in (self.connect_btn, self.sftp_btn, self.edit_btn, self.del_btn):
             b.setEnabled(has)
 
-    def _refresh_list(self):
-        self.session_list.clear()
+    def _refresh_list(self, query=""):
+        tree = self.session_tree
+        tree.clear()
+        groups = {}
         for s in self.sessions:
-            item = QListWidgetItem(s.get("name") or s.get("host") or "未命名")
-            proto = "SSL" if s.get("protocol") == "ssl" else "SSH"
-            item.setToolTip(f"{proto} {s.get('username','')}@{s.get('host','')}:{s.get('port')}")
-            item.setData(Qt.UserRole, s)
-            self.session_list.addItem(item)
+            name = s.get("name") or s.get("host") or "未命名"
+            if query and query not in name.lower() \
+                    and query not in str(s.get("host", "")).lower() \
+                    and query not in str(s.get("group", "")).lower() \
+                    and query not in str(s.get("username", "")).lower():
+                continue
+            gname = s.get("group") or "未分组"
+            groups.setdefault(gname, []).append(s)
+        for gname in sorted(groups):
+            gitem = QTreeWidgetItem()
+            gitem.setText(0, f"{gname} ({len(groups[gname])})")
+            gitem.setFlags(gitem.flags() & ~Qt.ItemIsSelectable)
+            tree.addTopLevelItem(gitem)
+            for s in groups[gname]:
+                item = QTreeWidgetItem()
+                item.setText(0, s.get("name") or s.get("host") or "未命名")
+                proto = "SSL" if s.get("protocol") == "ssl" else "SSH"
+                item.setToolTip(0, f"{proto} {s.get('username','')}@{s.get('host','')}:{s.get('port')}")
+                item.setData(0, Qt.UserRole, s)
+                gitem.addChild(item)
+        tree.expandAll()
         self._update_buttons()
 
     def _new_session(self):
@@ -226,7 +267,47 @@ class MainWindow(QMainWindow):
             s = dlg.get_session()
             self.sessions.append(s)
             config.save_sessions(self.sessions)
-            self._refresh_list()
+            self._refresh_list(self.search_edit.text().strip().lower())
+
+    # ---------------- 导入 / 导出 ----------------
+
+    def _import_sessions(self):
+        path, _ = QFileDialog.getOpenFileName(self, "导入会话", "",
+                                              "SSLTool 会话文件 (*.json);;所有文件 (*)")
+        if not path:
+            return
+        import json
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                incoming = json.load(f)
+            merged, added, updated = config.merge_sessions(self.sessions, incoming)
+        except ValueError as e:
+            QMessageBox.warning(self, "导入失败", str(e))
+            return
+        except Exception as e:
+            QMessageBox.warning(self, "导入失败", f"读取文件失败: {e}")
+            return
+        ret = QMessageBox.question(
+            self, "导入会话",
+            f"将新增 {added} 个会话，覆盖 {updated} 个同名会话。继续吗？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if ret != QMessageBox.Yes:
+            return
+        self.sessions = merged
+        config.save_sessions(self.sessions)
+        self._refresh_list(self.search_edit.text().strip().lower())
+        self.statusBar().showMessage(f"已导入 {added} 个会话（覆盖 {updated} 个）", 8000)
+
+    def _export_sessions(self):
+        path, _ = QFileDialog.getSaveFileName(self, "导出会话", "ssltool-sessions.json",
+                                              "SSLTool 会话文件 (*.json)")
+        if not path:
+            return
+        try:
+            n = config.export_sessions(self.sessions, path)
+            self.statusBar().showMessage(f"已导出 {n} 个会话到 {path}", 8000)
+        except Exception as e:
+            QMessageBox.warning(self, "导出失败", str(e))
 
     def _connect_selected(self):
         s = self._selected_session()
@@ -251,7 +332,7 @@ class MainWindow(QMainWindow):
                 config.delete_secret(f"session:{ns['id']}")
             if not ns.get("save_passphrase"):
                 config.delete_secret(f"passphrase:{ns['id']}")
-            self._refresh_list()
+            self._refresh_list(self.search_edit.text().strip().lower())
 
     def _delete_selected(self):
         s = self._selected_session()
@@ -266,7 +347,7 @@ class MainWindow(QMainWindow):
         config.save_sessions(self.sessions)
         config.delete_secret(f"session:{s.get('id')}")
         config.delete_secret(f"passphrase:{s.get('id')}")
-        self._refresh_list()
+        self._refresh_list(self.search_edit.text().strip().lower())
 
     # ---------------- 打开标签页 ----------------
 
@@ -315,6 +396,12 @@ class MainWindow(QMainWindow):
             client_cert=s.get("client_cert", ""),
             client_key=s.get("client_key", ""),
             forwards=list(s.get("forwards") or []),
+            jump_host=s.get("jump_host", ""),
+            jump_port=int(s.get("jump_port") or 22),
+            jump_username=s.get("jump_username", ""),
+            jump_auth=s.get("jump_auth", "password"),
+            jump_key_path=s.get("jump_key_path", ""),
+            jump_password=None,
         )
         if params["protocol"] != "ssh":
             return params
@@ -347,7 +434,34 @@ class MainWindow(QMainWindow):
                 if s.get("save_password") and sid:
                     config.set_secret(f"session:{sid}", pw)
             params["password"] = pw
+        if not self._gather_jump_auth(s, params):
+            return None
         return params
+
+    def _gather_jump_auth(self, s, params):
+        """跳板机凭据在连接时询问，不保存。返回 False 表示用户取消。"""
+        if not params.get("jump_host"):
+            return True
+        label = f"{params['jump_username']}@{params['jump_host']}:{params['jump_port']}"
+        if s.get("jump_auth") == "key":
+            path = s.get("jump_key_path", "")
+            if not path or not os.path.isfile(path):
+                QMessageBox.warning(self, "SSLTool", f"跳板机私钥文件不存在: {path}")
+                return False
+            pp, ok = QInputDialog.getText(
+                self, "跳板机私钥口令", f"跳板机 {label} 的密钥需要口令:",
+                QLineEdit.Password)
+            if not ok:
+                return False
+            params["jump_password"] = pp or None
+        else:
+            pw, ok = QInputDialog.getText(
+                self, "跳板机密码", f"请输入跳板机 {label} 的密码:",
+                QLineEdit.Password)
+            if not ok:
+                return False
+            params["jump_password"] = pw
+        return True
 
     @staticmethod
     def _key_needs_passphrase(path):

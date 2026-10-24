@@ -10,6 +10,10 @@
 测试 6（回显去重）：服务器回显 + 本地回显同时开启时，键入字符只显示一次。
 测试 7（主机密钥 TOFU）：未知密钥需确认并保存；密钥变更警告旧指纹；拒绝变更时
      服务器不应收到任何认证凭据；接受变更后记录更新并重新连接。
+测试 8（终端体验 V2.0）：会话日志落盘、备用屏幕 ESC 序列真实往返、括号粘贴包裹。
+测试 9（跳板机 V3.0）：经内嵌 SSH 跳板机的 direct-tcpip 通道连接目标并完成数据
+     往返；跳板机不可达时错误消息指明跳板机。
+测试 10（断点续传 V3.0）：续传从本地已有字节处继续、大小一致跳过、非续传覆盖。
 """
 import os
 import re
@@ -31,7 +35,9 @@ from PyQt5.QtWidgets import QApplication, QDialog
 
 from app import config
 from app.core import hostkey as hk
+from app.core.jump import JumpConnector
 from app.core.workers import SSHWorker
+from app.core.sftp_worker import SFTPWorker
 from app.ui.connect_dialog import ConnectDialog
 from app.ui.hostkey_dialog import HostKeyDialog
 from app.ui.main_window import MainWindow
@@ -130,6 +136,7 @@ class EchoServer(paramiko.ServerInterface):
     auth_attempts = 0   # 类属性：累计认证尝试次数（TOFU 拒绝路径验证用）
     record_data = False  # 类属性开关：记录客户端发来的原始字节（粘贴验证用）
     received = []       # record_data 开启时收集的原始字节
+    direct_requests = 0  # 类属性：direct-tcpip 通道请求次数（跳板机验证用）
 
     def __init__(self):
         self.echo = False
@@ -236,7 +243,8 @@ class EchoServer(paramiko.ServerInterface):
                              daemon=True).start()
 
     def check_channel_direct_tcpip_request(self, chanid, origin, destination):
-        """客户端 -L：服务器侧接受通道并转发到 destination。"""
+        """客户端 -L / 跳板机转发：服务器侧接受通道并转发到 destination。"""
+        EchoServer.direct_requests += 1
         self._direct_targets[chanid] = destination
         threading.Thread(target=self._serve_direct, args=(chanid,),
                          daemon=True).start()
@@ -831,18 +839,154 @@ def test_terminal_experience():
     print("[PASS] test_terminal_experience: 会话日志/备用屏幕/括号粘贴 全部正常")
 
 
+def test_jump_connect():
+    """V3.0 跳板机：经内嵌 SSH 跳板机的 direct-tcpip 通道连接目标，完整数据往返。"""
+    jump_port = _start_server()   # 跳板机（同一 _HOST_KEY，门禁已预置）
+    target_port = _start_server()  # 目标机
+
+    w = SSHWorker("127.0.0.1", target_port, "tester", password="pw",
+                  jump=JumpConnector("127.0.0.1", jump_port, "tester",
+                                     password="pw"))
+    received, errors = [], []
+    w.dataReceived.connect(received.append)
+    w.error.connect(errors.append)
+    w.start()
+    ok = _wait_for(lambda: w._connected, timeout=30.0)
+    if not ok:
+        w.stop()
+        w.wait(3000)
+        raise AssertionError("经跳板机连接失败: errors=%r" % errors)
+    got_welcome = _wait_for(
+        lambda: any(isinstance(x, bytes)
+                    and b"Welcome to SSLTool test sshd" in x for x in received),
+        timeout=10.0)
+    # 连接存续期间（stop 前）断言：跳板机连接已建立、目标流量经由
+    # 跳板机的 direct-tcpip 通道（探测 1 条 + 认证 1 条）。
+    jump_ok = (w._jump is not None and w._jump_client is not None
+               and w._jump_client.get_transport() is not None)
+    via_jump = EchoServer.direct_requests >= 2
+    w.stop()
+    w.wait(3000)
+    if not got_welcome:
+        raise AssertionError("经跳板机未收到目标服务器的欢迎语")
+    if not jump_ok:
+        raise AssertionError("worker 未持有跳板机连接")
+    if not via_jump:
+        raise AssertionError(
+            "目标流量应经由跳板机 direct-tcpip 通道（实际 %d 条）"
+            % EchoServer.direct_requests)
+
+    # 跳板机不可达 → error 消息应指明跳板机
+    w2 = SSHWorker("127.0.0.1", target_port, "tester", password="pw",
+                   jump=JumpConnector("127.0.0.1", 1, "tester", password="pw"))
+    errors2 = []
+    w2.error.connect(errors2.append)
+    w2.start()
+    ok = _wait_for(lambda: errors2, timeout=20.0)
+    w2.stop()
+    w2.wait(3000)
+    if not ok or not any("跳板机" in m for m in errors2):
+        raise AssertionError("跳板机失败应报跳板机错误: %r" % errors2)
+    print("[PASS] test_jump_connect: 跳板机直连/数据往返/失败提示 全部正常")
+
+
+class _FakeAttr:
+    def __init__(self, size):
+        self.st_size = size
+        self.st_mode = 0o100000  # S_IFREG
+        self.st_mtime = 0
+
+
+class _FakeFile:
+    def __init__(self, data):
+        self._data = data
+        self.pos = 0
+        self.seeks = []
+
+    def seek(self, off):
+        self.seeks.append(off)
+        self.pos = off
+
+    def read(self, n):
+        chunk = self._data[self.pos:self.pos + n]
+        self.pos += len(chunk)
+        return chunk
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _FakeSftp:
+    def __init__(self, content):
+        self.content = content
+        self.files = []
+
+    def stat(self, remote):
+        return _FakeAttr(len(self.content))
+
+    def open(self, remote, mode):
+        f = _FakeFile(self.content)
+        self.files.append(f)
+        return f
+
+
+def test_sftp_resume():
+    """V3.0 断点续传：续传从本地已有字节处继续、大小一致跳过、非续传覆盖。"""
+    tmp = tempfile.mkdtemp(prefix="ssltool_resume_")
+    remote = "/data.bin"
+    content = b"ABCDEFGH"
+
+    w = SFTPWorker("127.0.0.1", 22, "u", password="pw")
+    w._sftp = _FakeSftp(content)
+    done, progress = [], []
+    w.opDone.connect(done.append)
+    w.transferProgress.connect(lambda d, t: progress.append((d, t)))
+
+    # (1) 续传：本地已有前 4 字节 → 最终 8 字节且服务端 seek(4)
+    local = os.path.join(tmp, "f1.bin")
+    with open(local, "wb") as f:
+        f.write(b"ABCD")
+    w._do_download(remote, local, resume=True)
+    with open(local, "rb") as f:
+        got = f.read()
+    assert got == content, "续传后文件应为完整内容: %r" % got
+    assert w._sftp.files[-1].seeks and w._sftp.files[-1].seeks[0] == 4, \
+        "续传应从本地已写字节数处 seek"
+
+    # (2) 本地已完整 → 跳过
+    done.clear()
+    w._do_download(remote, local, resume=True)
+    assert done and "跳过" in done[-1], "大小一致时应跳过: %r" % done
+
+    # (3) 非续传：覆盖已有文件
+    done.clear()
+    local2 = os.path.join(tmp, "f2.bin")
+    with open(local2, "wb") as f:
+        f.write(b"XX")
+    w._do_download(remote, local2, resume=False)
+    with open(local2, "rb") as f:
+        got2 = f.read()
+    assert got2 == content, "非续传应覆盖为完整内容: %r" % got2
+    assert done and "下载完成" in done[-1]
+    print("[PASS] test_sftp_resume: 续传偏移/跳过/覆盖 全部正常")
+
+
 def main():
     app = QApplication.instance() or QApplication([])
     tests = [test_ssh_echo, test_new_session_while_connected,
              test_dialog_visibility, test_local_echo, test_echo_suppression,
              test_scroll_follow, test_port_forwarding, test_host_key_tofu,
-             test_terminal_experience]
+             test_terminal_experience, test_jump_connect, test_sftp_resume]
     for fn in tests:
         # 每个测试前复位服务器开关，防止前一测试的类属性状态污染
         EchoServer.spam = False
         EchoServer.never_echo = False
         EchoServer.record_data = False
         EchoServer.received = []
+        EchoServer.direct_requests = 0
         try:
             fn()
         except Exception as e:

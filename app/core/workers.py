@@ -95,9 +95,11 @@ class SSHWorker(BaseWorker):
     forwardError = pyqtSignal(str)
     hostKeyUnknown = pyqtSignal(str)        # 服务器指纹（首次连接）
     hostKeyChanged = pyqtSignal(str, str)   # 新指纹, 已记录指纹（疑似中间人）
+    jumpKeyUnknown = pyqtSignal(str, int, str)      # 跳板机 host, port, 指纹
+    jumpKeyChanged = pyqtSignal(str, int, str, str)  # 跳板机 host, port, 新指纹, 旧指纹
 
     def __init__(self, host, port, username, password=None, key_path=None,
-                 passphrase=None, forwards=None, parent=None):
+                 passphrase=None, forwards=None, jump=None, parent=None):
         super().__init__(parent)
         self.host = host
         self.port = int(port)
@@ -106,6 +108,8 @@ class SSHWorker(BaseWorker):
         self.key_path = key_path
         self.passphrase = passphrase
         self.forwards = list(forwards or [])
+        self._jump = jump          # JumpConnector 或 None
+        self._jump_client = None   # 跳板机 SSHClient（本线程建立，用于清理）
         self._client = None
         self._chan = None
         self._connected = False
@@ -198,10 +202,38 @@ class SSHWorker(BaseWorker):
 
     def run(self):
         reason = ""
+        sock_factory = None
         try:
+            if self._jump is not None:
+                jh, jp = self._jump.host, self._jump.port
+                # 跳板机自身的主机密钥同样走 TOFU 确认：确认之前
+                # 不会向跳板机发送任何密码 / 私钥签名。
+                self._gate = HostKeyGate(
+                    jh, jp,
+                    on_unknown=lambda fp: self.jumpKeyUnknown.emit(jh, jp, fp),
+                    on_changed=lambda fp, e: self.jumpKeyChanged.emit(jh, jp, fp, e))
+                try:
+                    verdict, _jk, _jfp, jexp = self._gate.wait()
+                except HostKeyProbeError as e:
+                    self.error.emit(f"跳板机：{e}")
+                    return
+                if verdict == "timeout":
+                    self.error.emit("跳板机主机密钥确认超时，连接已取消")
+                    return
+                if verdict == "cancelled":
+                    return
+                if verdict == "rejected":
+                    self.error.emit("已取消：跳板机主机密钥" + (
+                        "与既有记录不一致，未获确认" if jexp else "未获确认"))
+                    return
+                # 跳板机密钥确认后才向跳板机发送认证凭据
+                self._jump_client = self._jump.connect()
+                sock_factory = lambda: self._jump.open_channel(self.host, self.port)
+
             self._gate = HostKeyGate(self.host, self.port,
                                      on_unknown=self.hostKeyUnknown.emit,
-                                     on_changed=self.hostKeyChanged.emit)
+                                     on_changed=self.hostKeyChanged.emit,
+                                     sock_factory=sock_factory)
             verdict, _key, fp, expected = self._gate.wait()
             if verdict == "timeout":
                 self.error.emit("主机密钥确认超时，连接已取消")
@@ -227,6 +259,8 @@ class SSHWorker(BaseWorker):
                     kwargs["passphrase"] = self.passphrase
             else:
                 kwargs["password"] = self.password or ""
+            if sock_factory is not None:
+                kwargs["sock"] = sock_factory()
             client.connect(**kwargs)
             # 复核：认证连接的实际主机密钥必须与用户确认的值一致。
             # 探测与认证是两条独立 TCP 连接，这一步防中间人分别劫持。
@@ -264,7 +298,8 @@ class SSHWorker(BaseWorker):
                     reason = str(e)
                     break
         except HostKeyProbeError as e:
-            self.error.emit(str(e))
+            prefix = "经跳板机 " if self._jump is not None else ""
+            self.error.emit(prefix + str(e))
         except Exception as e:
             if not self._connected:
                 self.error.emit(f"连接失败: {e}")
@@ -283,6 +318,9 @@ class SSHWorker(BaseWorker):
                 pass
             self._chan = None
             self._client = None
+            if self._jump is not None:
+                self._jump.close()
+                self._jump_client = None
             if self._connected:
                 self.disconnected.emit(reason)
 

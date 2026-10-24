@@ -98,16 +98,20 @@ def check_known_host(host: str, port: int, key: paramiko.PKey):
     return "changed", fp, expected
 
 
-def probe_host_key(host: str, port: int, timeout: float = PROBE_TIMEOUT) -> paramiko.PKey:
+def probe_host_key(host: str, port: int, timeout: float = PROBE_TIMEOUT,
+                   sock=None) -> paramiko.PKey:
     """只做密钥交换取回服务器主机密钥，绝不发送任何用户凭据。
 
     使用裸 paramiko.Transport：start_client 完成 KEX 后立即关闭，
     密码 / 私钥认证（userauth 阶段）根本不会发生。
+    sock 参数用于跳板机场景：传入已建立的 direct-tcpip 转发通道
+    （paramiko.Channel 亦为 socket-like 对象）。
     """
-    try:
-        sock = socket.create_connection((host, int(port)), timeout=timeout)
-    except OSError as e:
-        raise HostKeyProbeError(f"无法连接 {host}:{port}（{e}）")
+    if sock is None:
+        try:
+            sock = socket.create_connection((host, int(port)), timeout=timeout)
+        except OSError as e:
+            raise HostKeyProbeError(f"无法连接 {host}:{port}（{e}）")
     t = paramiko.Transport(sock)
     try:
         try:
@@ -132,18 +136,21 @@ class HostKeyGate:
     GUI 线程通过 accept()/reject()/cancel() 唤醒等待中的 worker。
     """
 
-    def __init__(self, host, port, on_unknown=None, on_changed=None):
+    def __init__(self, host, port, on_unknown=None, on_changed=None,
+                 sock_factory=None):
         self.host = host
         self.port = int(port)
         self._on_unknown = on_unknown
         self._on_changed = on_changed
+        self._sock_factory = sock_factory  # 跳板机场景：返回转发通道的可调用
         self._event = threading.Event()
         self._accepted = False
         self._cancelled = False
 
     def wait(self, timeout: float = DECISION_TIMEOUT):
         """返回 (verdict, key, fp, expected)。可能抛出 HostKeyProbeError。"""
-        key = probe_host_key(self.host, self.port)
+        sock = self._sock_factory() if self._sock_factory else None
+        key = probe_host_key(self.host, self.port, sock=sock)
         status, fp, expected = check_known_host(self.host, self.port, key)
         if status == "ok":
             return "ok", key, fp, expected

@@ -28,38 +28,43 @@ def _fp_box(title: str, fingerprint: str) -> QFrame:
 
 
 class HostKeyDialog(QDialog):
-    """expected=None 表示首次连接（未知密钥）；否则为密钥变更警告。"""
+    """expected=None 表示首次连接（未知密钥）；否则为密钥变更警告。
 
-    def __init__(self, parent, host, port, fingerprint, expected=None):
+    jump=True 表示确认对象是跳板机（文案相应调整）。
+    """
+
+    def __init__(self, parent, host, port, fingerprint, expected=None,
+                 jump=False):
         super().__init__(parent)
         self.setModal(True)
         self.setMinimumWidth(540)
+        who = "跳板机" if jump else "服务器"
         if expected is None:
-            self.setWindowTitle("首次连接：确认服务器主机密钥")
+            self.setWindowTitle(f"首次连接：确认{who}主机密钥")
         else:
-            self.setWindowTitle("警告：服务器主机密钥已变更！")
+            self.setWindowTitle(f"警告：{who}主机密钥已变更！")
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
 
-        target = QLabel(f"服务器：{host}:{port}")
+        target = QLabel(f"{who}：{host}:{port}")
         target.setStyleSheet("font-weight: 600; font-size: 14px;")
         layout.addWidget(target)
 
         if expected is None:
             desc = QLabel(
-                "这是首次连接到该服务器，SSLTool 还没有它的主机密钥记录，\n"
+                f"这是首次连接到该{who}，SSLTool 还没有它的主机密钥记录，\n"
                 "无法验证其身份。请核对下方指纹（可向服务器管理员索取），\n"
                 "确认无误后再连接。指纹一旦确认将被保存，此后密钥变化会收到警告。")
             desc.setWordWrap(True)
             layout.addWidget(desc)
-            layout.addWidget(_fp_box("服务器主机密钥 SHA-256 指纹", fingerprint))
+            layout.addWidget(_fp_box(f"{who}主机密钥 SHA-256 指纹", fingerprint))
         else:
             warn = QLabel(
-                "⚠ 该服务器的主机密钥与既有记录不一致！\n"
+                f"⚠ 该{who}的主机密钥与既有记录不一致！\n"
                 "这可能意味着你正在遭受中间人攻击（有人试图截获你的会话和凭据），\n"
-                "也可能是服务器重装/更换了密钥。请务必先向服务器管理员核实！")
+                f"也可能是{who}重装/更换了密钥。请务必先向服务器管理员核实！")
             warn.setWordWrap(True)
             warn.setStyleSheet("color: #f56c6c; font-weight: 600;")
             layout.addWidget(warn)
@@ -80,13 +85,14 @@ class HostKeyDialog(QDialog):
         layout.addWidget(buttons)
 
 
-def confirm_unknown_host_key(parent, host, port, fingerprint) -> bool:
+def confirm_unknown_host_key(parent, host, port, fingerprint, jump=False) -> bool:
     """首次连接：请用户确认主机密钥。返回 True 表示接受。"""
-    return HostKeyDialog(parent, host, port, fingerprint, None).exec_() \
-        == QDialog.Accepted
+    return HostKeyDialog(parent, host, port, fingerprint, None,
+                         jump=jump).exec_() == QDialog.Accepted
 
 
-def confirm_changed_host_key(parent, host, port, fingerprint, expected) -> bool:
+def confirm_changed_host_key(parent, host, port, fingerprint, expected,
+                             jump=False) -> bool:
     """密钥变更：醒目警告后请用户决定。返回 True 表示仍要连接。"""
-    return HostKeyDialog(parent, host, port, fingerprint, expected).exec_() \
-        == QDialog.Accepted
+    return HostKeyDialog(parent, host, port, fingerprint, expected,
+                         jump=jump).exec_() == QDialog.Accepted

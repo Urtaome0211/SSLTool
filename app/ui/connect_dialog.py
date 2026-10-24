@@ -2,9 +2,9 @@
 import os
 
 from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
-                             QLineEdit, QComboBox, QSpinBox, QCheckBox,
-                             QPushButton, QWidget, QFileDialog, QMessageBox,
-                             QLabel, QPlainTextEdit)
+                             QGridLayout, QLineEdit, QComboBox, QSpinBox,
+                             QCheckBox, QPushButton, QWidget, QFileDialog,
+                             QMessageBox, QLabel, QPlainTextEdit)
 
 from app import config
 from app.core.forwarders import parse_forwards
@@ -28,6 +28,10 @@ class ConnectDialog(QDialog):
         self.name_edit = QLineEdit(s.get("name", ""))
         self.name_edit.setPlaceholderText("例如: 我的服务器")
         self.form.addRow("名称", self.name_edit)
+
+        self.group_edit = QLineEdit(s.get("group", ""))
+        self.group_edit.setPlaceholderText("例如: 生产 / 测试（留空为未分组）")
+        self.form.addRow("分组", self.group_edit)
 
         self.protocol_combo = QComboBox()
         self.protocol_combo.addItems(["SSH 终端", "SSL 加密通道"])
@@ -123,12 +127,50 @@ class ConnectDialog(QDialog):
         fh.addWidget(self.forwards_edit)
         self.form.addRow("端口转发", fwd_row)
 
+        jump_row = QWidget()
+        jg = QGridLayout(jump_row)
+        jg.setContentsMargins(0, 0, 0, 0)
+        jg.setSpacing(6)
+        self.jump_host_edit = QLineEdit(s.get("jump_host", ""))
+        self.jump_host_edit.setPlaceholderText("跳板机地址（可选）")
+        self.jump_port_spin = QSpinBox()
+        self.jump_port_spin.setRange(1, 65535)
+        self.jump_port_spin.setValue(int(s.get("jump_port") or 22))
+        self.jump_user_edit = QLineEdit(s.get("jump_username", ""))
+        self.jump_user_edit.setPlaceholderText("跳板机用户")
+        self.jump_auth_combo = QComboBox()
+        self.jump_auth_combo.addItems(["密码认证", "私钥认证"])
+        self.jump_auth_combo.setCurrentIndex(
+            1 if s.get("jump_auth") == "key" else 0)
+        self.jump_key_edit = QLineEdit(s.get("jump_key_path", ""))
+        self.jump_key_edit.setPlaceholderText("跳板机私钥路径")
+        jump_key_browse = QPushButton("浏览…")
+        jump_key_browse.setObjectName("secondary")
+        jump_key_browse.clicked.connect(
+            lambda: self._browse(self.jump_key_edit, "选择跳板机私钥"))
+        jg.addWidget(self.jump_host_edit, 0, 0, 1, 2)
+        jg.addWidget(self.jump_port_spin, 0, 2)
+        jg.addWidget(self.jump_user_edit, 0, 3)
+        jg.addWidget(self.jump_auth_combo, 1, 0)
+        jg.addWidget(self.jump_key_edit, 1, 1, 1, 2)
+        jg.addWidget(jump_key_browse, 1, 3)
+        jump_hint = QLabel("经 SSH 跳板机连接目标（跳板机密码在连接时询问，不保存）")
+        jump_hint.setStyleSheet("color: #909399; font-size: 11px;")
+        self.form.addRow("跳板机", jump_row)
+        self.form.addRow("", jump_hint)
+
+        self.readonly_check = QCheckBox("SFTP 只读模式（禁止上传 / 删除 / 修改）")
+        self.readonly_check.setChecked(bool(s.get("sftp_readonly")))
+        self.form.addRow("", self.readonly_check)
+
         # 供 _apply_visibility 使用的行引用（PyQt5 的 QFormLayout 无
         # Qt 6.4 的 setRowVisible(row, bool)，只能显式隐藏控件+标签）
         self._key_row = key_row
         self._cert_row = cert_row
         self._ckey_row = ckey_row
         self._fwd_row = fwd_row
+        self._jump_row = jump_row
+        self._jump_hint = jump_hint
 
         layout.addLayout(self.form)
 
@@ -171,6 +213,9 @@ class ConnectDialog(QDialog):
             (self._cert_row, not ssh),        # 客户端证书
             (self._ckey_row, not ssh),        # 客户端私钥
             (self._fwd_row, ssh),             # 端口转发
+            (self._jump_row, ssh),            # 跳板机
+            (self._jump_hint, ssh),           # 跳板机说明
+            (self.readonly_check, ssh),       # SFTP 只读
         )
         for widget, visible in rows:
             widget.setVisible(visible)
@@ -209,6 +254,16 @@ class ConnectDialog(QDialog):
             elif not self.pass_edit.text().strip():
                 QMessageBox.warning(self, "SSLTool", "请输入密码（或改用私钥认证）")
                 return
+            jump_host = self.jump_host_edit.text().strip()
+            if jump_host:
+                if not self.jump_user_edit.text().strip():
+                    QMessageBox.warning(self, "SSLTool", "请输入跳板机用户名")
+                    return
+                if self.jump_auth_combo.currentIndex() == 1:
+                    jkey = self.jump_key_edit.text().strip()
+                    if not jkey or not os.path.isfile(jkey):
+                        QMessageBox.warning(self, "SSLTool", "请选择有效的跳板机私钥文件")
+                        return
             try:
                 parse_forwards(self._forward_lines())
             except ValueError as e:
@@ -237,4 +292,11 @@ class ConnectDialog(QDialog):
         s["client_cert"] = self.cert_edit.text().strip()
         s["client_key"] = self.ckey_edit.text().strip()
         s["forwards"] = self._forward_lines()
+        s["group"] = self.group_edit.text().strip()
+        s["sftp_readonly"] = self.readonly_check.isChecked()
+        s["jump_host"] = self.jump_host_edit.text().strip()
+        s["jump_port"] = self.jump_port_spin.value()
+        s["jump_username"] = self.jump_user_edit.text().strip()
+        s["jump_auth"] = "key" if self.jump_auth_combo.currentIndex() == 1 else "password"
+        s["jump_key_path"] = self.jump_key_edit.text().strip()
         return s

@@ -188,6 +188,27 @@ config.save_settings({"dark": True})
 check("设置持久化", config.load_settings().get("dark") is True)
 config.save_settings({"dark": False})
 
+# 导入导出：merge / export / 非法输入
+s2 = config.make_session(name="生产机", host="10.0.0.8", port=2222,
+                         username="ops", group="生产")
+m, added, updated = config.merge_sessions(
+    [s], [s2, dict(s, host="new.example.com")])
+check("merge 新增与覆盖计数", added == 1 and updated == 1)
+check("merge 后按 id 去重", len(m) == 2)
+export_path = tmp / "export.json"
+n = config.export_sessions(m, export_path)
+check("导出会话文件", n == 2 and export_path.exists())
+try:
+    config.merge_sessions([], "不是列表")
+    check("merge 非列表输入抛 ValueError", False)
+except ValueError:
+    check("merge 非列表输入抛 ValueError", True)
+check("make_session 含 V3.0 字段",
+      all(k in s for k in ("group", "sftp_readonly", "jump_host", "jump_port",
+                           "jump_username", "jump_auth", "jump_key_path"))
+      and s["group"] == "" and s["sftp_readonly"] is False
+      and s["jump_port"] == 22 and s["jump_auth"] == "password")
+
 # ---------- 3c. 会话日志 ----------
 from app.core.session_log import SessionLog
 
@@ -231,15 +252,68 @@ check("删除记录后 → unknown",
 
 # ---------- 4. 主窗口 ----------
 win = MainWindow()
-check("主窗口会话列表加载", win.session_list.count() == 1)
+check("主窗口会话树加载", win.session_tree.topLevelItemCount() == 1
+      and win.session_tree.topLevelItem(0).childCount() == 1)
 check("欢迎页存在", win.tabs.count() == 1 and win.tabs.tabText(0) == "欢迎")
 check("菜单已创建", len(win.menuBar().actions()) == 3)
+win.search_edit.setText("不存在的内容")
+app.processEvents()
+check("搜索无命中时列表为空", win.session_tree.topLevelItemCount() == 0)
+win.search_edit.setText("127")
+app.processEvents()
+check("搜索按主机命中", win.session_tree.topLevelItemCount() == 1
+      and win.session_tree.topLevelItem(0).childCount() == 1)
+win.search_edit.setText("")
+win.sessions.append(config.make_session(name="生产机", host="10.0.0.8",
+                                        group="生产"))
+win._refresh_list()
+check("分组树按组归类", win.session_tree.topLevelItemCount() == 2)
+check("组头文本带计数", all("(" in win.session_tree.topLevelItem(i).text(0)
+                        for i in range(2)))
+child = win.session_tree.topLevelItem(0).child(0)
+check("子项携带会话数据", child.data(0, Qt.UserRole) is not None)
+win.session_tree.setCurrentItem(child)
+check("选中会话后操作按钮可用",
+      win.connect_btn.isEnabled() and win.sftp_btn.isEnabled())
 win.dark_act.setChecked(True)
 check("深色主题实时切换", "#1e2126" in QApplication.instance().styleSheet())
 win.dark_act.setChecked(False)
 check("切回浅色主题", "#f5f7fa" in QApplication.instance().styleSheet())
 check("主题偏好持久化", config.load_settings().get("dark") is False)
 win.close()
+
+# ---------- 4b. V3.0 连接能力 ----------
+from app.core.jump import JumpConnector, JumpError
+from app.ui.hostkey_dialog import HostKeyDialog
+from app.ui.sftp_tab import SFTPTab
+
+jc = JumpConnector("127.0.0.1", 1, "root", password="x")
+check("跳板机标签格式", jc.label == "root@127.0.0.1:1")
+try:
+    jc.connect()
+    jc.close()
+    check("跳板机连接失败抛 JumpError", False)
+except JumpError:
+    check("跳板机连接失败抛 JumpError", True)
+
+dlg_jump = HostKeyDialog(None, "jump.example.com", 22, "SHA256:AA", None,
+                         jump=True)
+check("跳板机密钥对话框文案", "跳板机" in dlg_jump.windowTitle())
+dlg_jump.deleteLater()
+
+tab_ro = SFTPTab("只读", dict(host="127.0.0.1", port=22, username="u",
+                              sftp_readonly=True))
+check("只读会话禁用写操作按钮",
+      not tab_ro._action_btns["删除"].isEnabled()
+      and not tab_ro._action_btns["上传文件"].isEnabled()
+      and not tab_ro._action_btns["重命名"].isEnabled())
+check("只读会话禁止远程树拖放", not tab_ro._remote_tree.acceptDrops())
+tab_ro.shutdown()
+tab_ro.deleteLater()
+tab_rw = SFTPTab("读写", dict(host="127.0.0.1", port=22, username="u"))
+check("普通会话写操作按钮可用", tab_rw._action_btns["删除"].isEnabled())
+tab_rw.shutdown()
+tab_rw.deleteLater()
 
 # ---------- 5. 连接失败路径（127.0.0.1:1 快速拒绝） ----------
 check("SSH 连接失败触发 error",

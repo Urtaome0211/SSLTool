@@ -4,6 +4,7 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame,
                              QPushButton, QCheckBox)
 
 from app.core.workers import SSHWorker, SSLWorker
+from app.core.jump import JumpConnector
 from app.core.session_log import SessionLog
 from app.ui.hostkey_dialog import (confirm_changed_host_key,
                                    confirm_unknown_host_key)
@@ -103,11 +104,17 @@ class ConsoleTab(QWidget):
                           client_cert=p.get("client_cert") or None,
                           client_key=p.get("client_key") or None)
         else:
+            jump = None
+            if p.get("jump_host"):
+                jump = JumpConnector(
+                    p["jump_host"], p.get("jump_port") or 22,
+                    p.get("jump_username", ""), password=p.get("jump_password"),
+                    key_path=p.get("jump_key_path") or None)
             w = SSHWorker(p["host"], int(p["port"]), p.get("username", ""),
                           password=p.get("password"),
                           key_path=p.get("key_path") or None,
                           passphrase=p.get("passphrase"),
-                          forwards=p.get("forwards"))
+                          forwards=p.get("forwards"), jump=jump)
         w.connected.connect(self._on_connected)
         w.dataReceived.connect(self._on_data)
         w.error.connect(self._on_error)
@@ -119,6 +126,8 @@ class ConsoleTab(QWidget):
             w.forwardError.connect(self._on_forward_error)
             w.hostKeyUnknown.connect(self._on_host_key_unknown)
             w.hostKeyChanged.connect(self._on_host_key_changed)
+            w.jumpKeyUnknown.connect(self._on_jump_key_unknown)
+            w.jumpKeyChanged.connect(self._on_jump_key_changed)
         self.worker = w
 
     def start(self):
@@ -206,6 +215,23 @@ class ConsoleTab(QWidget):
             self.worker.resolve_host_key(ok)
         if not ok:
             self._set_status("已取消：主机密钥与记录不一致", "#f56c6c")
+
+    def _on_jump_key_unknown(self, host, port, fp):
+        self._set_status("确认跳板机密钥…", "#e6a23c")
+        ok = confirm_unknown_host_key(self, host, int(port), fp, jump=True)
+        if self.worker:
+            self.worker.resolve_host_key(ok)
+        if not ok:
+            self._set_status("已取消：未确认跳板机密钥", "#f56c6c")
+
+    def _on_jump_key_changed(self, host, port, fp, expected):
+        self._set_status("跳板机密钥已变更！", "#f56c6c")
+        ok = confirm_changed_host_key(self, host, int(port), fp, expected,
+                                      jump=True)
+        if self.worker:
+            self.worker.resolve_host_key(ok)
+        if not ok:
+            self._set_status("已取消：跳板机密钥与记录不一致", "#f56c6c")
 
     def _on_data_sent(self, data: bytes):
         if self.worker:

@@ -7,10 +7,11 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame,
                              QLineEdit, QPushButton, QSplitter, QTreeView,
                              QTreeWidget, QTreeWidgetItem, QHeaderView,
                              QFileSystemModel, QMessageBox, QInputDialog,
-                             QFileDialog, QProgressDialog, QStyle,
-                             QAbstractItemView)
+                             QFileDialog, QProgressDialog, QStyle, QMenu,
+                             QApplication, QAbstractItemView)
 
 from app.core.sftp_worker import SFTPWorker
+from app.core.jump import JumpConnector
 from app.ui.hostkey_dialog import (confirm_changed_host_key,
                                    confirm_unknown_host_key)
 
@@ -161,11 +162,13 @@ class SFTPTab(QWidget):
             ("重命名", self._rename),
             ("删除", self._remove),
         ]
+        self._action_btns = {}
         for text, slot in actions:
             btn = QPushButton(text)
             btn.setObjectName("secondary")
             btn.clicked.connect(slot)
             bar.addWidget(btn)
+            self._action_btns[text] = btn
         bar.addStretch(1)
 
         # ---- 文件区 ----
@@ -188,6 +191,16 @@ class SFTPTab(QWidget):
         up_btn.clicked.connect(self._go_up)
         refresh_btn.clicked.connect(self._refresh)
         close_btn.clicked.connect(lambda: self.tabClosed.emit(self))
+
+        # ---- 只读模式 ----
+        self._readonly = bool(params.get("sftp_readonly"))
+        if self._readonly:
+            for text in ("上传文件", "上传文件夹", "新建文件夹", "重命名", "删除"):
+                self._action_btns[text].setEnabled(False)
+            self._remote_tree.setAcceptDrops(False)
+            self._remote_tree.viewport().setAcceptDrops(False)
+            self._remote_tree.setDragEnabled(False)
+            self._remote_tree.setDragDropMode(QAbstractItemView.NoDragDrop)
 
         self._create_worker()
 
@@ -220,15 +233,23 @@ class SFTPTab(QWidget):
         tree.setSelectionBehavior(QAbstractItemView.SelectRows)
         tree.setEditTriggers(QAbstractItemView.NoEditTriggers)
         tree.itemDoubleClicked.connect(self._on_item_double_clicked)
+        tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        tree.customContextMenuRequested.connect(self._on_remote_context_menu)
         return tree
 
     # ---------------- worker 生命周期 ----------------
 
     def _create_worker(self):
         p = self._params
+        jump = None
+        if p.get("jump_host"):
+            jump = JumpConnector(
+                p["jump_host"], p.get("jump_port") or 22,
+                p.get("jump_username", ""), password=p.get("jump_password"),
+                key_path=p.get("jump_key_path") or None)
         w = SFTPWorker(p["host"], int(p["port"]), p.get("username", ""),
                        password=p.get("password"), key_path=p.get("key_path") or None,
-                       passphrase=p.get("passphrase"))
+                       passphrase=p.get("passphrase"), jump=jump)
         w.connected.connect(self._on_connected)
         w.error.connect(self._on_error)
         w.disconnected.connect(self._on_disconnected)
@@ -238,6 +259,8 @@ class SFTPTab(QWidget):
         w.transferProgress.connect(self._on_progress)
         w.hostKeyUnknown.connect(self._on_host_key_unknown)
         w.hostKeyChanged.connect(self._on_host_key_changed)
+        w.jumpKeyUnknown.connect(self._on_jump_key_unknown)
+        w.jumpKeyChanged.connect(self._on_jump_key_changed)
         self.worker = w
 
     def start(self):
@@ -289,6 +312,23 @@ class SFTPTab(QWidget):
             self.worker.resolve_host_key(ok)
         if not ok:
             self._set_status("已取消：主机密钥与记录不一致", "#f56c6c")
+
+    def _on_jump_key_unknown(self, host, port, fp):
+        self._set_status("确认跳板机密钥…", "#e6a23c")
+        ok = confirm_unknown_host_key(self, host, int(port), fp, jump=True)
+        if self.worker:
+            self.worker.resolve_host_key(ok)
+        if not ok:
+            self._set_status("已取消：未确认跳板机密钥", "#f56c6c")
+
+    def _on_jump_key_changed(self, host, port, fp, expected):
+        self._set_status("跳板机密钥已变更！", "#f56c6c")
+        ok = confirm_changed_host_key(self, host, int(port), fp, expected,
+                                      jump=True)
+        if self.worker:
+            self.worker.resolve_host_key(ok)
+        if not ok:
+            self._set_status("已取消：跳板机密钥与记录不一致", "#f56c6c")
 
     def _on_disconnected(self, reason):
         self._connected = False
@@ -344,6 +384,35 @@ class SFTPTab(QWidget):
             return False
         return True
 
+    def _check_writable(self):
+        if not self._check_worker():
+            return False
+        if self._readonly:
+            QMessageBox.information(self, "只读模式", "该会话已开启 SFTP 只读模式，禁止上传 / 删除 / 修改。")
+            return False
+        return True
+
+    def _confirm_resume(self, local_path):
+        """本地文件已存在时询问处理方式。返回 ("resume", True) / ("fresh", True) /
+        ("skip", False)。目录项无需询问（按合并遍历处理）。"""
+        if not os.path.isfile(local_path):
+            return ("fresh", True)
+        box = QMessageBox(self)
+        box.setWindowTitle("文件已存在")
+        box.setText(f"本地已存在：{os.path.basename(local_path)}\n\n"
+                    "「续传」将仅下载缺失的部分（断点续传）；\n"
+                    "「重新下载」将覆盖现有文件。")
+        resume_btn = box.addButton("续传", QMessageBox.AcceptRole)
+        fresh_btn = box.addButton("重新下载", QMessageBox.DestructiveRole)
+        box.addButton("取消", QMessageBox.RejectRole)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is resume_btn:
+            return ("resume", True)
+        if clicked is fresh_btn:
+            return ("fresh", True)
+        return ("skip", False)
+
     def _begin_progress(self, text):
         if self.worker:
             self.worker.begin_transfer()
@@ -369,18 +438,19 @@ class SFTPTab(QWidget):
             self._progress = None
 
     def _upload_file(self):
-        if not self._check_worker():
+        if not self._check_writable():
             return
-        local, _ = QFileDialog.getOpenFileName(self, "选择要上传的文件", "", "所有文件 (*)")
-        if not local:
+        locals_, _ = QFileDialog.getOpenFileNames(self, "选择要上传的文件", "", "所有文件 (*)")
+        if not locals_:
             return
-        remote = posixpath.join(self._remote_path, os.path.basename(local))
         self._begin_progress("正在上传…")
-        self._pending_ops += 1
-        self.worker.upload(local, remote)
+        for local in locals_:
+            remote = posixpath.join(self._remote_path, os.path.basename(local))
+            self._pending_ops += 1
+            self.worker.upload(local, remote)
 
     def _upload_dir(self):
-        if not self._check_worker():
+        if not self._check_writable():
             return
         local = QFileDialog.getExistingDirectory(self, "选择要上传的文件夹")
         if not local:
@@ -402,12 +472,17 @@ class SFTPTab(QWidget):
             return
         self._begin_progress("正在下载…")
         for it in items:
+            remote = it.data(0, Qt.UserRole)
+            local = os.path.join(target_dir, it.text(0))
+            mode, ok = ("fresh", True) if it.data(0, Qt.UserRole + 1) \
+                else self._confirm_resume(local)
+            if not ok:
+                continue
             self._pending_ops += 1
-            self.worker.download(it.data(0, Qt.UserRole),
-                                 os.path.join(target_dir, it.text(0)))
+            self.worker.download(remote, local, resume=(mode == "resume"))
 
     def _drop_upload(self, local_paths):
-        if not self._check_worker():
+        if not self._check_writable():
             return
         if not local_paths:
             return
@@ -425,11 +500,17 @@ class SFTPTab(QWidget):
         self._begin_progress("正在下载…")
         for rp in remote_paths:
             base = posixpath.basename(rp.rstrip("/")) or "download"
+            local = os.path.join(target_dir, base)
+            mode = "fresh"
+            if os.path.isfile(local):
+                mode, ok = self._confirm_resume(local)
+                if not ok:
+                    continue
             self._pending_ops += 1
-            self.worker.download(rp, os.path.join(target_dir, base))
+            self.worker.download(rp, local, resume=(mode == "resume"))
 
     def _mkdir(self):
-        if not self._check_worker():
+        if not self._check_writable():
             return
         name, ok = QInputDialog.getText(self, "新建文件夹", "文件夹名称:")
         if not ok or not name.strip():
@@ -437,7 +518,7 @@ class SFTPTab(QWidget):
         self.worker.mkdir(posixpath.join(self._remote_path, name.strip()))
 
     def _rename(self):
-        if not self._check_worker():
+        if not self._check_writable():
             return
         items = self._remote_tree.selectedItems()
         if len(items) != 1:
@@ -451,7 +532,7 @@ class SFTPTab(QWidget):
         self.worker.rename(old, posixpath.join(posixpath.dirname(old), new.strip()))
 
     def _remove(self):
-        if not self._check_worker():
+        if not self._check_writable():
             return
         items = self._remote_tree.selectedItems()
         if not items:
@@ -490,3 +571,37 @@ class SFTPTab(QWidget):
             return
         if item.data(0, Qt.UserRole + 1):
             self.worker.listdir(item.data(0, Qt.UserRole))
+
+    # ---------------- 远程树右键菜单 ----------------
+
+    def _on_remote_context_menu(self, pos):
+        tree = self._remote_tree
+        item = tree.itemAt(pos)
+        if item is not None:
+            item.setSelected(True)
+        menu = QMenu(self)
+        act_dl = menu.addAction("下载到…")
+        act_copy = menu.addAction("复制路径")
+        menu.addSeparator()
+        act_rn = menu.addAction("重命名")
+        act_rm = menu.addAction("删除")
+        if self._readonly or item is None:
+            act_rn.setEnabled(False)
+            act_rm.setEnabled(False)
+        if item is None:
+            act_dl.setEnabled(False)
+            act_copy.setEnabled(False)
+        act = menu.exec_(tree.viewport().mapToGlobal(pos))
+        if act is act_dl:
+            self._download()
+        elif act is act_copy:
+            paths = [it.data(0, Qt.UserRole)
+                     for it in tree.selectedItems()
+                     if it.data(0, Qt.UserRole)]
+            if paths:
+                QApplication.clipboard().setText("\n".join(paths))
+                self._set_status(f"已复制 {len(paths)} 个路径", "#67c23a")
+        elif act is act_rn:
+            self._rename()
+        elif act is act_rm:
+            self._remove()

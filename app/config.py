@@ -112,6 +112,42 @@ def save_sessions(sessions: list) -> None:
         json.dump(sessions, f, ensure_ascii=False, indent=2)
 
 
+def export_sessions(sessions: list, path) -> int:
+    """把会话列表导出为 JSON 文件（仅会话配置，不含钥匙串中的密码）。
+
+    返回导出的会话数。
+    """
+    with open(str(path), "w", encoding="utf-8") as f:
+        json.dump(sessions, f, ensure_ascii=False, indent=2)
+    return len(sessions)
+
+
+def merge_sessions(current: list, incoming):
+    """按 id 合并导入的会话：同 id 覆盖、新 id 追加、非法条目过滤。
+
+    返回 (合并后的列表, 新增数, 更新数)。
+    """
+    if not isinstance(incoming, list):
+        raise ValueError("会话文件格式不正确：应为会话列表")
+    clean = [s for s in incoming
+             if isinstance(s, dict) and (s.get("host") or s.get("name"))]
+    by_id = {}
+    for s in current:
+        by_id[s.get("id")] = s
+    added = updated = 0
+    for s in clean:
+        sid = s.get("id")
+        if sid and sid in by_id:
+            by_id[sid] = s
+            updated += 1
+        else:
+            s = dict(s)
+            s["id"] = sid or new_session_id()
+            by_id[s["id"]] = s
+            added += 1
+    return list(by_id.values()), added, updated
+
+
 def new_session_id() -> str:
     return uuid.uuid4().hex
 
@@ -138,6 +174,7 @@ def make_session(**kwargs) -> dict:
     s = {
         "id": new_session_id(),
         "name": "",
+        "group": "",                # 会话分组（空 = 未分组）
         "protocol": "ssh",          # ssh | ssl
         "host": "",
         "port": 22,
@@ -150,6 +187,12 @@ def make_session(**kwargs) -> dict:
         "client_cert": "",
         "client_key": "",
         "forwards": [],             # SSH 端口转发规则（OpenSSH 风格 L:/R:/D:）
+        "sftp_readonly": False,     # SFTP 只读模式（客户端禁用写操作）
+        "jump_host": "",            # 跳板机（jump host / bastion）
+        "jump_port": 22,
+        "jump_username": "",
+        "jump_auth": "password",    # password | key（跳板机密码不落盘，连接时询问）
+        "jump_key_path": "",
     }
     s.update(kwargs)
     return s
