@@ -49,6 +49,8 @@ _TMP = Path(tempfile.mkdtemp(prefix="ssltool_e2e_"))
 config.DATA_DIR = _TMP / ".ssltool"
 config.SESSIONS_FILE = config.DATA_DIR / "sessions.json"
 config.SECRETS_FILE = config.DATA_DIR / "secrets.json"
+config.SETTINGS_FILE = config.DATA_DIR / "settings.json"
+config.PROJECTS_FILE = config.DATA_DIR / "projects.json"
 
 _HOST_KEY = paramiko.RSAKey.generate(2048)
 _TRANSPORTS = []  # 保持 transport 引用，防止被 GC

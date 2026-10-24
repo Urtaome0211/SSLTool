@@ -14,9 +14,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from PyQt5.QtCore import QEvent, Qt
+from PyQt5.QtCore import QEvent, Qt, pyqtSignal
 from PyQt5.QtGui import QKeyEvent
-from PyQt5.QtWidgets import QApplication
+from PyQt5.QtWidgets import QApplication, QWidget
 
 from app import config
 from app.theme import get_qss, make_app_icon
@@ -170,6 +170,7 @@ config.DATA_DIR = tmp
 config.SESSIONS_FILE = tmp / "sessions.json"
 config.SECRETS_FILE = tmp / "secrets.json"
 config.SETTINGS_FILE = tmp / "settings.json"
+config.PROJECTS_FILE = tmp / "projects.json"
 s = config.make_session(name="测试机", host="127.0.0.1", port=22, username="root")
 config.save_sessions([s])
 loaded = config.load_sessions()
@@ -208,6 +209,9 @@ check("make_session 含 V3.0 字段",
                            "jump_username", "jump_auth", "jump_key_path"))
       and s["group"] == "" and s["sftp_readonly"] is False
       and s["jump_port"] == 22 and s["jump_auth"] == "password")
+check("make_session 含 V3.1 工程字段",
+      s.get("project") == config.DEFAULT_PROJECT_ID and "last_used" in s)
+check("默认工程自动创建", config.load_projects()[0]["id"] == config.DEFAULT_PROJECT_ID)
 
 # ---------- 3c. 会话日志 ----------
 from app.core.session_log import SessionLog
@@ -255,7 +259,7 @@ win = MainWindow()
 check("主窗口会话树加载", win.session_tree.topLevelItemCount() == 1
       and win.session_tree.topLevelItem(0).childCount() == 1)
 check("欢迎页存在", win.tabs.count() == 1 and win.tabs.tabText(0) == "欢迎")
-check("菜单已创建", len(win.menuBar().actions()) == 3)
+check("菜单已创建", len(win.menuBar().actions()) == 4)
 win.search_edit.setText("不存在的内容")
 app.processEvents()
 check("搜索无命中时列表为空", win.session_tree.topLevelItemCount() == 0)
@@ -280,6 +284,60 @@ check("深色主题实时切换", "#1e2126" in QApplication.instance().styleShee
 win.dark_act.setChecked(False)
 check("切回浅色主题", "#f5f7fa" in QApplication.instance().styleSheet())
 check("主题偏好持久化", config.load_settings().get("dark") is False)
+
+# ---------- 4a. V3.1 会话与工程 ----------
+config.save_projects([{"id": config.DEFAULT_PROJECT_ID, "name": "默认工程"},
+                      {"id": "p2", "name": "测试工程"}])
+s_cur = config.make_session(name="当前工程机", host="10.0.0.10")
+s_cur["last_used"] = "2026-10-24T12:00:00"
+s_other = config.make_session(name="二号工程机", host="10.0.0.9", project="p2")
+win2 = MainWindow()
+win2.sessions = [s_cur, s_other]
+win2._refresh_list()
+check("工程切换器列出全部工程", win2.project_combo.count() == 2
+      and win2._current_project == config.DEFAULT_PROJECT_ID)
+check("会话树只显示当前工程", win2.session_tree.topLevelItemCount() == 2
+      and win2.session_tree.topLevelItem(1).childCount() == 1)
+check("最近连接分组置顶", win2.session_tree.topLevelItem(0).text(0) == "最近连接")
+win2.project_combo.setCurrentIndex(1)
+app.processEvents()
+check("切换工程后过滤会话", win2._current_project == "p2"
+      and win2.session_tree.topLevelItemCount() == 1
+      and win2.session_tree.topLevelItem(0).child(0).text(0) == "二号工程机")
+check("工程选择持久化", config.load_settings().get("current_project") == "p2")
+win2.project_combo.setCurrentIndex(0)
+app.processEvents()
+
+
+class _FakeTab(QWidget):
+    tabClosed = pyqtSignal(object)
+
+    def __init__(self):
+        super().__init__()
+        self.closed = False
+
+    def shutdown(self):
+        self.closed = True
+
+
+fake = _FakeTab()
+fake._ws_kind = "console"
+fake._ws_sid = s_cur["id"]
+win2.tabs.addTab(fake, "工作区标签")
+win2._tab_names[fake] = "工作区标签"
+check("工作区快照采集", win2._snapshot_workspace() == [["console", s_cur["id"]]])
+win2._save_workspace()
+check("工作区已持久化",
+      config.load_settings().get("workspaces", {}).get(config.DEFAULT_PROJECT_ID)
+      == [["console", s_cur["id"]]])
+win2._update_tab_state(fake, "connected")
+check("标签状态点更新",
+      win2.tabs.tabText(win2.tabs.indexOf(fake)) == "● 工作区标签")
+win2._close_all_tabs()
+check("关闭全部标签页（保留欢迎页）", win2.tabs.count() == 1
+      and win2.tabs.tabText(0) == "欢迎" and fake.closed)
+win2.close()
+config.save_projects([{"id": config.DEFAULT_PROJECT_ID, "name": "默认工程"}])
 win.close()
 
 # ---------- 4b. V3.0 连接能力 ----------

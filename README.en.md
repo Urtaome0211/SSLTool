@@ -13,6 +13,7 @@ A flat-design SSL / SSH / SFTP desktop client (Python + PyQt5).
 - **SSH jump host (ProxyJump)**: connect to the target server through a jump host (both SSH terminal and SFTP); the jump host's key goes through the same TOFU confirmation, and no credentials are sent to the jump host before confirmation
 - **SSH port forwarding**: local forward (-L), remote forward (-R), dynamic SOCKS5 proxy (-D), one rule per line in the session settings; results are printed in the terminal after connecting
 - **Session management**: connection profiles are stored in `~/.ssltool/sessions.json`; **session groups** (collapsible tree view), **search filtering**, and **import / export** (JSON format; on import, sessions with the same ID are merged / updated); passwords and key passphrases go to the system keychain (keyring), falling back to `~/.ssltool/secrets.json` when no backend is available — on Windows the fallback is encrypted with DPAPI (Windows Data Protection API) so only the current Windows user can decrypt it; on other platforms it degrades to an obfuscated format (not recommended; install a keyring backend instead)
+- **Sessions & projects**: a **project switcher** at the top of the sidebar — each project has its own session list and tab workspace (environment isolation); **workspace snapshots**: switching projects / quitting saves the open console / sftp tabs per project, restorable with one click (Ctrl+R, or automatically at startup if enabled); a **recent connections** group pinned at the top (latest 5 by usage); tab context menu (close / close others / close all / reconnect) and shortcuts (Ctrl+Tab, Ctrl+1–9, Ctrl+W); tab titles carry a state dot (● connected / ○ disconnected / ◌ connecting)
 - **Dark theme**: menu "View → Dark Theme" (Ctrl+D) one-click toggle, preference is saved
 
 ## Security
@@ -52,8 +53,14 @@ Double-click `build.bat` (uses PyInstaller; output goes to `dist\SSLTool`).
 13. SFTP resumable download: when downloading a file whose local counterpart already exists, you are asked to "resume / overwrite / cancel"; resuming continues from the existing local byte count (directory batch downloads ask per file; already-complete targets are skipped automatically)
 14. Session groups and search: set a "Group" when creating / editing a session (leave empty for ungrouped); the left session list shows groups as a collapsible tree; the search box above the list filters by name / host in real time
 15. Import / export: menu "Session → Export Sessions…" exports all sessions (without passwords) as a JSON backup; "Import Sessions…" reads a JSON file, updating sessions with the same ID and appending new ones
+16. Projects: switch projects with the dropdown at the top of the sidebar, `+` to create one; the "Project" menu renames / deletes the current project (its sessions move back to the default project when deleted); the "Project" field when creating a session picks its owner. Each project's session list and tab workspace are isolated from the others; projects are stored in `~/.ssltool/projects.json`
+17. Workspace snapshots: after opening console / sftp tabs, switching projects or quitting records "which tabs were open" under that project; menu "Project → Restore Current Project Workspace" (Ctrl+R) restores them in one click (tabs that need authentication prompt for their password). Enable "Restore last workspace at startup" to do it automatically on the next launch
+18. Tab operations: right-click a tab to close / close others / close all / reconnect (disconnected terminal tabs); Ctrl+Tab and Ctrl+Shift+Tab cycle through tabs, Ctrl+1–9 jumps to the Nth tab, Ctrl+W closes the current tab
+19. Recent connections: sessions you have connected are pinned in the "Recent" group at the top of the session tree (latest 5, by usage time); double-click to open
 
-## Terminal shortcuts
+## Shortcuts
+
+(In-terminal shortcuts are sent to the server first; main-window level shortcuts are listed below)
 
 | Keys | Action |
 | --- | --- |
@@ -62,6 +69,10 @@ Double-click `build.bat` (uses PyInstaller; output goes to `dist\SSLTool`).
 | Ctrl+V / Ctrl+Shift+V | Paste and send (automatic bracketed paste) |
 | Ctrl+F | In-terminal search (Enter next, Shift+Enter previous, Esc close) |
 | Ctrl+click URL | Open the link in the system browser |
+| Ctrl+Tab / Ctrl+Shift+Tab | Switch tabs (main-window level) |
+| Ctrl+1 ~ Ctrl+9 | Jump to the Nth tab |
+| Ctrl+W | Close the current tab |
+| Ctrl+R | Restore the current project's workspace |
 | Ctrl+A | Select all |
 | Arrow keys / Home / End / Ins / Del | Send the corresponding escape sequences |
 | PgUp / PgDn | Scroll back through the history buffer |
@@ -82,7 +93,7 @@ SSLTool/
 ├── requirements.txt
 ├── run.bat / build.bat
 ├── app/
-│   ├── config.py              # session and credential storage
+│   ├── config.py              # session / project / credential storage
 │   ├── theme.py               # flat QSS theme and app icon
 │   ├── core/
 │   │   ├── workers.py         # SSH / SSL connection threads (cert details + jump host)
@@ -97,9 +108,9 @@ SSLTool/
 │       ├── sftp_tab.py        # SFTP file manager tab (drag-and-drop / cancelable)
 │       ├── hostkey_dialog.py  # host key confirmation / change warning dialogs
 │       ├── connect_dialog.py  # new / edit session dialog
-│       └── main_window.py     # main window
+│       └── main_window.py     # main window (project switching / workspace snapshots / tab management)
 └── tests/
-    ├── smoke_test.py          # offscreen smoke tests (89 checks)
+    ├── smoke_test.py          # offscreen smoke tests (100 checks)
     ├── gui_boot.py            # main window startup self-check
     └── e2e_test.py            # end-to-end tests with an embedded SSH server (echo / dedup / scrolling / dialog / port forwarding / TOFU / terminal experience / jump host / resume, 11 tests)
 ```

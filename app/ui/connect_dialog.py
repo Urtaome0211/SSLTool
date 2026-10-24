@@ -33,6 +33,13 @@ class ConnectDialog(QDialog):
         self.group_edit.setPlaceholderText("例如: 生产 / 测试（留空为未分组）")
         self.form.addRow("分组", self.group_edit)
 
+        self.project_combo = QComboBox()
+        for p in config.load_projects():
+            self.project_combo.addItem(p["name"], p["id"])
+        idx = self.project_combo.findData(s.get("project") or config.DEFAULT_PROJECT_ID)
+        self.project_combo.setCurrentIndex(max(idx, 0))
+        self.form.addRow("工程", self.project_combo)
+
         self.protocol_combo = QComboBox()
         self.protocol_combo.addItems(["SSH 终端", "SSL 加密通道"])
         self.protocol_combo.setCurrentIndex(0 if s.get("protocol", "ssh") == "ssh" else 1)
@@ -293,6 +300,7 @@ class ConnectDialog(QDialog):
         s["client_key"] = self.ckey_edit.text().strip()
         s["forwards"] = self._forward_lines()
         s["group"] = self.group_edit.text().strip()
+        s["project"] = self.project_combo.currentData() or config.DEFAULT_PROJECT_ID
         s["sftp_readonly"] = self.readonly_check.isChecked()
         s["jump_host"] = self.jump_host_edit.text().strip()
         s["jump_port"] = self.jump_port_spin.value()

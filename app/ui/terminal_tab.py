@@ -13,6 +13,7 @@ from app.ui.terminal_widget import TerminalWidget
 
 class ConsoleTab(QWidget):
     tabClosed = pyqtSignal(object)  # 关闭请求，携带自身
+    stateChanged = pyqtSignal(str)  # connecting | connected | disconnected | error
 
     def __init__(self, name: str, params: dict, parent=None):
         super().__init__(parent)
@@ -20,6 +21,7 @@ class ConsoleTab(QWidget):
         self._name = name
         self.worker = None
         self._log = None  # SessionLog；日志是增值功能，任何异常都不影响终端
+        self.state = "connecting"
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -159,9 +161,20 @@ class ConsoleTab(QWidget):
 
     # ---------------- 信号处理 ----------------
 
+    _STATE_BY_COLOR = {
+        "#67c23a": "connected",
+        "#909399": "disconnected",
+        "#e6a23c": "connecting",
+        "#f56c6c": "error",
+    }
+
     def _set_status(self, text, color):
         self._status.setText(text)
         self._status.setStyleSheet(f"color: {color};")
+        state = self._STATE_BY_COLOR.get(color, "disconnected")
+        if state != self.state:
+            self.state = state
+            self.stateChanged.emit(state)
 
     def _on_data(self, data: bytes):
         self.terminal.feed_remote(data)

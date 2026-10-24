@@ -22,7 +22,9 @@ DATA_DIR = Path.home() / ".ssltool"
 SESSIONS_FILE = DATA_DIR / "sessions.json"
 SECRETS_FILE = DATA_DIR / "secrets.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
+PROJECTS_FILE = DATA_DIR / "projects.json"
 SERVICE = "SSLTool"
+DEFAULT_PROJECT_ID = "default"
 
 
 # ---------------- Windows DPAPI（回退存储的静态加密） ----------------
@@ -103,13 +105,49 @@ def _load_json(path: Path, default):
 
 def load_sessions() -> list:
     ensure_data_dir()
-    return _load_json(SESSIONS_FILE, [])
+    data = _load_json(SESSIONS_FILE, [])
+    if not isinstance(data, list):
+        return []
+    out = []
+    for s in data:
+        if not isinstance(s, dict):
+            continue
+        s.setdefault("project", DEFAULT_PROJECT_ID)
+        s.setdefault("group", "")
+        s.setdefault("last_used", "")
+        out.append(s)
+    return out
 
 
 def save_sessions(sessions: list) -> None:
     ensure_data_dir()
     with open(SESSIONS_FILE, "w", encoding="utf-8") as f:
         json.dump(sessions, f, ensure_ascii=False, indent=2)
+
+
+# ---------------- 工程（Project / Workspace） ----------------
+
+def load_projects() -> list:
+    """读取工程列表；首次使用或文件损坏时返回默认工程。"""
+    ensure_data_dir()
+    data = _load_json(PROJECTS_FILE, None)
+    if not isinstance(data, list) or not data:
+        return [{"id": DEFAULT_PROJECT_ID, "name": "默认工程"}]
+    out = [p for p in data
+           if isinstance(p, dict) and p.get("id") and p.get("name")]
+    if not out:
+        return [{"id": DEFAULT_PROJECT_ID, "name": "默认工程"}]
+    return out
+
+
+def save_projects(projects: list) -> None:
+    ensure_data_dir()
+    with open(PROJECTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(projects, f, ensure_ascii=False, indent=2)
+
+
+def new_project_id() -> str:
+    return uuid.uuid4().hex
 
 
 def export_sessions(sessions: list, path) -> int:
@@ -174,6 +212,7 @@ def make_session(**kwargs) -> dict:
     s = {
         "id": new_session_id(),
         "name": "",
+        "project": DEFAULT_PROJECT_ID,  # 所属工程（工程切换时用于过滤侧栏）
         "group": "",                # 会话分组（空 = 未分组）
         "protocol": "ssh",          # ssh | ssl
         "host": "",
@@ -193,6 +232,7 @@ def make_session(**kwargs) -> dict:
         "jump_username": "",
         "jump_auth": "password",    # password | key（跳板机密码不落盘，连接时询问）
         "jump_key_path": "",
+        "last_used": "",            # 最近一次连接时间（ISO 字符串，用于最近连接排序）
     }
     s.update(kwargs)
     return s
